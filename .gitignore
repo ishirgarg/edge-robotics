@@ -1,0 +1,27 @@
+# project outputs
+out/
+*.json
+*.csv
+*.nsys-rep
+*.sqlite
+
+# jax/tensorboard traces
+**/plugins/profile/
+*.xplane.pb
+*.trace.json.gz
+*.perfetto-trace
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# the cloned dependency repo (kept out of our VCS; clone separately, see README)
+/openpi/
+
+# env
+.env

@@ -1,0 +1,59 @@
+# Conda environment for the edge-robotics profiler.
+#
+# IMPORTANT ordering: the cloned ./openpi repo must exist BEFORE creating this env
+# (the editable installs reference it). See README.md.
+#
+# openpi is a uv-workspace project; we install it WITHOUT its own dependency
+# resolution (see install.sh, `pip install --no-deps -e ./openpi`) and instead
+# pin the subset actually needed for JAX inference here. This deliberately skips
+# heavy/unused deps (lerobot, tensorflow, gym-aloha, dlimp, wandb) that openpi
+# only needs for data loading / training, not for inference.
+#
+# Create with:  GIT_LFS_SKIP_SMUDGE=1 conda env create -f environment.yml
+# then:         conda activate edge-robotics && bash install.sh
+name: edge-robotics
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - git-lfs
+  - pip:
+      # --- uv override-dependencies from openpi/pyproject.toml (pin first) ---
+      - ml-dtypes==0.4.1
+      - tensorstore==0.1.74
+      # --- JAX + Flax stack (GPU) ---
+      - jax[cuda12]==0.5.3
+      - flax==0.10.2
+      - orbax-checkpoint==0.11.13
+      - chex==0.1.90
+      - equinox>=0.11.8
+      # --- openpi model/runtime deps actually imported by the JAX inference path ---
+      - augmax>=0.3.4
+      - dm-tree>=0.1.8
+      - einops>=0.8.0
+      - flatbuffers>=24.3.25
+      - fsspec[gcs]>=2024.6.0
+      - imageio>=2.36.1
+      - jaxtyping==0.2.36
+      - beartype==0.19.0
+      - ml_collections==1.0.0
+      - "numpy>=1.22.4,<2.0.0"
+      - opencv-python-headless>=4.10.0.84   # headless: avoids libGL on servers
+      - pillow>=11.0.0
+      - safetensors
+      - sentencepiece>=0.2.0
+      - torch==2.7.1                         # imported at top of openpi/models/model.py
+      - transformers==4.53.2                 # imported via models_pytorch (import-time only)
+      - tqdm-loggable>=0.2
+      - treescope>=0.1.7
+      - typing-extensions>=4.12.2
+      - filelock>=3.16.1
+      # --- openpi-client (local workspace pkg; deps: msgpack/websockets) ---
+      - msgpack>=1.0.5
+      - websockets>=11.0
+      - -e ./openpi/packages/openpi-client
+      # --- our CLI + profiler tooling ---
+      - tyro>=0.9.5
+      - tensorboard
+      - tensorboard-plugin-profile

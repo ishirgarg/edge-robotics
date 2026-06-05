@@ -1,0 +1,22 @@
+[project]
+name = "edge-robotics"
+version = "0.1.0"
+description = "Profiler-driven latency study for robotics foundation models at the edge (pi-0.5, JAX)."
+requires-python = ">=3.11"
+# Runtime deps are pinned in environment.yml (openpi + JAX stack). These are the
+# only things this package itself adds; both are already provided by the env, so
+# install.sh uses `pip install --no-deps -e .`.
+dependencies = [
+    "tyro>=0.9.5",
+    "numpy>=1.22.4,<2.0.0",
+]
+
+[project.scripts]
+profile-policy = "edge_robotics.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["edge_robotics"]
