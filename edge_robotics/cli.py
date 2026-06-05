@@ -1,14 +1,12 @@
 """CLI config + orchestration for the edge-robotics profiler.
 
 This module is import-light on purpose: defining `Config` must NOT import jax/openpi, so the
-entrypoint (scripts/profile_policy.py) can parse args and set CUDA_VISIBLE_DEVICES *before*
-the first `import jax`. All heavy imports live inside `run()`.
+entrypoint (scripts/profile_policy.py) can parse args and set CUDA_VISIBLE_DEVICES / XLA_FLAGS
+*before* the first `import jax`. All heavy imports live inside `run()`.
 """
 
 from __future__ import annotations
 
-import dataclasses
-import os
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -23,13 +21,13 @@ class Config:
     checkpoint: str
     """Checkpoint dir: gs:// URI, local path, or the literal 'random' for random-init (no download)."""
     gpu: int
-    """CUDA device index to pin (this machine: 4-7 are idle)."""
+    """CUDA device index to pin."""
 
     # --- operational knobs (have defaults, all overridable) ---
     prompt_lens: list[int] = field(default_factory=lambda: [200])
     """Prompt lengths (max_token_len) to sweep, e.g. --prompt-lens 16 32 64 128 200."""
     num_steps: int = 10
-    """Flow-matching denoise steps for the headline run."""
+    """Flow-matching denoise steps."""
     warmup: int = 3
     """Warmup iterations (absorb JIT compile) before timing."""
     iters: int = 20
@@ -37,21 +35,9 @@ class Config:
     batch_size: int = 1
     """Inference batch size."""
     output: str = "out/profile"
-    """Output path prefix for <prefix>.json and <prefix>.csv."""
-
-    # --- phase-attribution methods ---
-    regression: bool = True
-    """Run the num_steps regression (Action vs Vision+VLM split). Robust, parser-free."""
-    regression_steps: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
-    """num_steps values used for the regression fit."""
-    probe_vision: bool = True
-    """Directly time the public SigLIP encoder to split Vision from VLM (VLM = intercept - Vision)."""
-    jax_trace: bool = False
-    """Capture a JAX profiler trace and parse it for the Vision-vs-VLM device-time split."""
+    """Output path prefix for <prefix>.json and <prefix>.csv (overwritten on rerun)."""
     trace_dir: str | None = None
-    """Where to write JAX traces (default: <output>_trace)."""
-    nsys: bool = False
-    """Print the Nsight Systems (CUDA) command to wrap this run for a kernel-level timeline."""
+    """Where to write JAX traces (default: <output>_trace). Wiped per prompt_len on each run."""
 
 
 def _make_system(name: str):
@@ -63,11 +49,13 @@ def _make_system(name: str):
 
 
 def run(config: Config) -> None:
+    import os
+    import shutil
+
     import jax
 
     from .metrics import build_row
     from .profiling.jax_profiler import parse_trace, profile_inference
-    from .profiling.regression import fit_num_steps_regression
     from .profiling.walltime import time_callable
     from .report import render_table, write_outputs
 
@@ -79,9 +67,24 @@ def run(config: Config) -> None:
             f"[run] WARNING: expected exactly 1 visible GPU (set CUDA_VISIBLE_DEVICES={config.gpu}); "
             f"got {n_dev}. Timings may be off."
         )
+    # Phase attribution needs CUDA graphs off so kernels keep their named_scope metadata; the
+    # entrypoint sets this before importing jax. Warn loudly if it didn't take.
+    if "xla_gpu_enable_command_buffer=" not in os.environ.get("XLA_FLAGS", ""):
+        print(
+            "[run] WARNING: XLA_FLAGS lacks '--xla_gpu_enable_command_buffer=' — CUDA graphs may be "
+            "ON, which strips per-op trace metadata and breaks phase attribution. Run via "
+            "scripts/profile_policy.py (it sets this before importing jax)."
+        )
 
     system = _make_system(config.system)
     trace_dir = config.trace_dir or f"{config.output}_trace"
+
+    # A rerun overrides old results: JSON/CSV are truncated by write_outputs, and we wipe the whole
+    # trace dir up front so orphaned per-L subdirs from a previous run (e.g. a different
+    # --prompt-lens) can't linger or be mis-parsed.
+    shutil.rmtree(trace_dir, ignore_errors=True)
+    if os.path.exists(f"{config.output}.json"):
+        print(f"[run] overwriting existing results at {config.output}.{{json,csv}} and {trace_dir}/")
 
     rows = []
     top_meta: dict = {}
@@ -105,8 +108,8 @@ def run(config: Config) -> None:
                 "batch_size": config.batch_size,
                 "warmup": config.warmup,
                 "iters": config.iters,
-                "regression_steps": config.regression_steps if config.regression else None,
                 "jax_version": loaded.meta.get("jax_version"),
+                "attribution": "jax.named_scope trace buckets (CUDA graphs disabled)",
                 "model": {
                     k: loaded.meta.get(k)
                     for k in (
@@ -124,54 +127,21 @@ def run(config: Config) -> None:
         print("[run] timing E2E (full sample_actions)...")
         e2e_samples = time_callable(loaded.infer(), loaded.block, warmup=config.warmup, iters=config.iters)
 
-        vision_probe_ms = None
-        if config.probe_vision and loaded.vision_infer is not None:
-            print("[run] probing Vision (public SigLIP encoder over all images)...")
-            import numpy as _np
-
-            vsamples = time_callable(loaded.vision_infer, loaded.block, warmup=config.warmup, iters=config.iters)
-            vision_probe_ms = float(_np.median(vsamples))
-            print(f"[run]   vision={vision_probe_ms:.3f} ms")
-
-        regression = None
-        if config.regression:
-            print(f"[run] num_steps regression over {config.regression_steps}...")
-            regression = fit_num_steps_regression(
-                loaded.infer_at,
-                loaded.block,
-                steps_list=config.regression_steps,
-                warmup=config.warmup,
-                iters=config.iters,
-            )
+        ld = os.path.join(trace_dir, f"L{L}")
+        print(f"[run] capturing JAX profiler trace -> {ld}")
+        profile_inference(loaded.infer(), loaded.block, ld, warmup=config.warmup, iters=config.iters)
+        trace = parse_trace(ld, iters=config.iters)
+        if trace.get("ok"):
+            p = trace["phases_ms_per_infer"]
             print(
-                f"[run]   slope={regression['slope_ms_per_step']:.3f} ms/step, "
-                f"intercept={regression['intercept_ms']:.3f} ms, r2={regression['r2']:.4f}"
+                f"[run]   vision={p['vision']:.3f} vlm={p['vlm']:.3f} action={p['action']:.3f} ms/infer "
+                f"(attributed {trace['attributed_frac']*100:.1f}% of {trace['total_gpu_ms_per_infer']:.3f}ms GPU)"
             )
+        else:
+            print(f"[run]   trace parse failed: {trace.get('error')} (E2E/Freq still reported)")
 
-        trace = None
-        if config.jax_trace:
-            ld = os.path.join(trace_dir, f"L{L}")
-            print(f"[run] capturing JAX profiler trace -> {ld}")
-            profile_inference(loaded.infer(), loaded.block, ld, warmup=config.warmup, iters=config.iters)
-            trace = parse_trace(ld, iters=config.iters)
-            if trace.get("ok"):
-                print(
-                    f"[run]   trace total GPU device time: {trace['total_gpu_ms_per_infer']:.3f} ms/infer "
-                    f"(cross-check vs E2E)"
-                )
-            else:
-                print(f"[run]   trace parse failed: {trace.get('error')} (headline numbers unaffected)")
-
-        row = build_row(
-            prompt_len=L,
-            num_steps=config.num_steps,
-            e2e_samples=e2e_samples,
-            regression=regression,
-            trace=trace,
-            meta=loaded.meta,
-            vision_probe_ms=vision_probe_ms,
-        )
-        rows.append(row)
+        rows.append(build_row(prompt_len=L, num_steps=config.num_steps, e2e_samples=e2e_samples,
+                              trace=trace, meta=loaded.meta))
         # free device memory between configs (each L re-jits at a new shape)
         del loaded
 
@@ -179,20 +149,29 @@ def run(config: Config) -> None:
     json_path, csv_path = write_outputs(config.output, rows, top_meta)
     print(f"\n[run] wrote {json_path} and {csv_path}")
 
-    if config.nsys:
-        from .profiling.cuda_profiler import print_nsys_hint
-
-        print_nsys_hint(config)
-
 
 def main() -> None:
     """Console-script entry (`profile-policy`). Prefer scripts/profile_policy.py for GPU pinning."""
+    import os
+
     import tyro
 
     config = tyro.cli(Config)
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(config.gpu))
     os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
+    _ensure_command_buffers_disabled()
     run(config)
+
+
+def _ensure_command_buffers_disabled() -> None:
+    """Append '--xla_gpu_enable_command_buffer=' (disable CUDA graphs) to XLA_FLAGS so the
+    profiler can attribute device time per phase. Must run before the first `import jax`."""
+    import os
+
+    flag = "--xla_gpu_enable_command_buffer="
+    existing = os.environ.get("XLA_FLAGS", "")
+    if "xla_gpu_enable_command_buffer=" not in existing:
+        os.environ["XLA_FLAGS"] = (existing + " " + flag).strip()
 
 
 if __name__ == "__main__":

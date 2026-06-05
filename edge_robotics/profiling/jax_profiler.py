@@ -1,16 +1,23 @@
-"""JAX profiler capture + trace parsing.
+"""JAX profiler capture + per-phase device-time attribution.
 
-`profile_inference` runs UNMODIFIED inference under `jax.profiler` (which records CUDA kernels
-via CUPTI, so the same trace doubles as CUDA-level data) and writes a TensorBoard/XProf logdir
-that also contains a gzipped Chrome-trace JSON (`*.trace.json.gz`).
+`profile_inference` runs inference under `jax.profiler` (which records CUDA kernels via CUPTI)
+and writes a TensorBoard/XProf logdir that also contains a gzipped Chrome-trace JSON
+(`*.trace.json.gz`).
 
 `parse_trace` reads that JSON directly (stdlib gzip+json — no xprof/tensorboard API needed) and
-reports total GPU device time per inference plus the heaviest kernels. NOTE: the optimized,
-fused XLA graph does NOT label kernels as img/llm (they show as `gemm_fusion_dot_*`,
-`loop_convert_fusion_*`, generic `name=jit(fun)/jit(main)`), so the trace can NOT separate
-Vision from VLM on its own. That split is done by the direct vision probe (see systems/pi05_jax
-`vision_infer`) + the num_steps regression. The trace here is a captured artifact + a GPU-time
-cross-check against the wall-clock E2E. It never raises; on failure it returns {"ok": False}.
+buckets GPU device time into the Vision / VLM / Action phases. The split is possible because the
+system tags the public image/LLM submodule calls with `jax.named_scope` (see
+`systems/pi05_jax.py:apply_namescope_patch`); the scope shows up on every device event as a
+`/`-delimited path segment of `args["name"]`, e.g.
+    jit(fun)/jit(main)/vision/_Module/Transformer/while/body/...
+so we sum `dur` per matching segment.
+
+IMPORTANT: this only works when XLA command buffers (CUDA graphs) are DISABLED
+(`XLA_FLAGS=--xla_gpu_enable_command_buffer=`, set before `import jax` — the entrypoint does
+this). With CUDA graphs on, the bulk of kernels are captured into graphs that strip per-op
+metadata (no `name`, only a `cuda_graph_id`), and attribution collapses to ~0%.
+
+`parse_trace` never raises; on failure it returns {"ok": False, "error": ...}.
 """
 
 from __future__ import annotations
@@ -21,8 +28,13 @@ import glob
 import gzip
 import json
 import os
+import shutil
 from collections.abc import Callable
 from typing import Any
+
+# The phase scopes, matched as exact path-segments of the trace event name. Mirrors
+# systems/pi05_jax.PHASE_SCOPES (kept local to avoid importing jax/openpi here).
+PHASE_SCOPES = ("vision", "vlm", "action")
 
 
 @contextlib.contextmanager
@@ -45,7 +57,12 @@ def profile_inference(
     warmup: int,
     iters: int,
 ) -> str:
-    """Warm up (compile), then capture `iters` steady-state inferences. Returns logdir."""
+    """Warm up (compile), then capture `iters` steady-state inferences. Returns logdir.
+
+    The logdir is wiped first so a rerun never parses a stale trace from a previous run (jax
+    writes a fresh timestamped subdir each time, which would otherwise accumulate).
+    """
+    shutil.rmtree(logdir, ignore_errors=True)
     for _ in range(warmup):
         block(infer())
     with capture_trace(logdir):
@@ -70,8 +87,26 @@ def _gpu_pids(events: list[dict]) -> set[int]:
     return gpu_pids
 
 
+def _scope_of(args: dict) -> str | None:
+    """Return the phase scope tagged on this op, matched as an exact path-segment of args['name']
+    (so 'action_out_proj' is NOT mistaken for 'action'), or None if unscoped."""
+    segs = set(str(args.get("name", "")).split("/"))
+    for s in PHASE_SCOPES:
+        if s in segs:
+            return s
+    return None
+
+
 def parse_trace(logdir: str, *, iters: int) -> dict:
-    """Read the Chrome-trace JSON; return total GPU device ms/infer + top kernels (cross-check)."""
+    """Read the Chrome-trace JSON; bucket GPU device time into Vision/VLM/Action (ms per infer).
+
+    Returns a dict with ok=True and:
+      phases_ms_per_infer : {vision, vlm, action}
+      residual_ms_per_infer : device time not under any phase scope (inter-phase glue)
+      total_gpu_ms_per_infer : all GPU device time / iters (cross-check vs E2E)
+      attributed_frac : fraction of GPU time that landed in a phase (sanity; want >> 0)
+      top_kernels : heaviest kernels by name (debugging)
+    """
     try:
         path = find_trace_json(logdir)
         if not path:
@@ -80,6 +115,7 @@ def parse_trace(logdir: str, *, iters: int) -> dict:
             events = json.load(f).get("traceEvents", [])
         gpu_pids = _gpu_pids(events)
 
+        per_scope_us: dict[str, float] = collections.defaultdict(float)
         per_name_us: dict[str, float] = collections.defaultdict(float)
         total_gpu_us = 0.0
         for e in events:
@@ -87,17 +123,27 @@ def parse_trace(logdir: str, *, iters: int) -> dict:
                 continue
             if gpu_pids and e.get("pid") not in gpu_pids:
                 continue
-            per_name_us[e.get("name", "")] += float(e["dur"])
-            total_gpu_us += float(e["dur"])
+            dur = float(e["dur"])
+            total_gpu_us += dur
+            per_name_us[e.get("name", "")] += dur
+            per_scope_us[_scope_of(e.get("args", {}) or {}) or "_residual"] += dur
 
         n = max(int(iters), 1)
+        phases_ms = {s: per_scope_us.get(s, 0.0) / 1000.0 / n for s in PHASE_SCOPES}
+        residual_ms = per_scope_us.get("_residual", 0.0) / 1000.0 / n
+        total_ms = total_gpu_us / 1000.0 / n
+        attributed = sum(per_scope_us.get(s, 0.0) for s in PHASE_SCOPES)
+        attributed_frac = attributed / total_gpu_us if total_gpu_us > 0 else 0.0
         top = sorted(per_name_us.items(), key=lambda kv: -kv[1])[:25]
         return {
             "ok": True,
             "trace_json": path,
             "gpu_pids": sorted(p for p in gpu_pids if p is not None),
-            "total_gpu_ms_per_infer": (total_gpu_us / 1000.0) / n,
-            "top_kernels": [{"name": k, "ms_per_infer": (v / 1000.0) / n} for k, v in top],
+            "phases_ms_per_infer": phases_ms,
+            "residual_ms_per_infer": residual_ms,
+            "total_gpu_ms_per_infer": total_ms,
+            "attributed_frac": attributed_frac,
+            "top_kernels": [{"name": k, "ms_per_infer": v / 1000.0 / n} for k, v in top],
         }
     except Exception as exc:  # noqa: BLE001 - best-effort, must not break a run
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}

@@ -2,9 +2,11 @@
 
 Loads the model exactly the way openpi's own inference path does
 (`restore_params` + `BaseModelConfig.load`, then `nnx_utils.module_jit(sample_actions)` —
-the same JIT wrapper `openpi.policies.policy.Policy` uses) and hands back an UNMODIFIED
-`sample_actions` callable. We never reimplement or instrument the forward pass; the profiler
-attributes phases from the JAX profiler trace + a num_steps regression over this callable.
+the same JIT wrapper `openpi.policies.policy.Policy` uses) and hands back the `sample_actions`
+callable. The forward math is never reimplemented; the only instrumentation is semantically
+inert `jax.named_scope` tags wrapped around the public image/LLM submodule calls so the JAX
+profiler trace can attribute device time to the Vision / VLM / Action phases (see
+`apply_namescope_patch` below and `edge_robotics/profiling/jax_profiler.py:parse_trace`).
 
 Config values mirror openpi/src/openpi/training/config.py so we don't need to import the
 training config registry (which pulls in lerobot/tensorflow data-loading deps we don't want).
@@ -28,6 +30,47 @@ PI05_REGISTRY: dict[str, dict] = {
 # SigLIP So400m/14 @224x224 -> (224/14)^2 = 256 tokens per image (nominal; informational only).
 _TOKENS_PER_IMAGE = 256
 
+# The three phases the profiler trace is bucketed into (see profiling/jax_profiler.py). The
+# strings are the jax.named_scope labels and the trace path-segments parse_trace matches on.
+PHASE_SCOPES = ("vision", "vlm", "action")
+
+
+def apply_namescope_patch(model) -> None:
+    """Tag the public image/LLM submodule calls with `jax.named_scope` so the profiler trace can
+    attribute device time per phase. NOT a forward-pass rewrite: each wrapper just opens a scope
+    and forwards verbatim to the original `__call__`.
+
+    pi-0.5 builds `self.PaliGemma = nnx.Dict(llm=ToNNX(Gemma), img=ToNNX(SigLIP))`, so `img` and
+    `llm` are instances of the SAME `nnx_bridge.ToNNX` class -- we therefore patch that one
+    `__call__` and pick the scope from the call arguments:
+      * `method="embed"`        -> "vlm"     (Gemma token embedding)
+      * first arg is a token list -> "vlm" if no kv_cache (prefix prefill), else "action" (denoise)
+      * otherwise (image tensor)  -> "vision" (SigLIP encode)
+    The patch is applied to the class once per process (guarded by a sentinel) so a prompt-length
+    sweep -- which calls load() once per length -- never stacks wrappers.
+    """
+    import jax
+
+    bridge_t = type(model.PaliGemma.img)
+    if getattr(bridge_t, "_edge_namescoped", False):
+        return  # already patched this process
+    orig_call = bridge_t.__call__
+
+    def scoped_call(self, *args, **kwargs):
+        method = kwargs.get("method")
+        first = args[0] if args else None
+        if method == "embed":
+            scope = "vlm"
+        elif isinstance(first, (list, tuple)):  # Gemma forward: [prefix, None] or [None, suffix]
+            scope = "action" if kwargs.get("kv_cache") is not None else "vlm"
+        else:  # SigLIP image encode (4-D image tensor + train= kwarg)
+            scope = "vision"
+        with jax.named_scope(scope):
+            return orig_call(self, *args, **kwargs)
+
+    bridge_t.__call__ = scoped_call
+    bridge_t._edge_namescoped = True
+
 
 class Pi05JaxSystem(ProfiledSystem):
     def load(
@@ -39,7 +82,6 @@ class Pi05JaxSystem(ProfiledSystem):
         num_steps: int,
         batch_size: int,
     ) -> LoadedSystem:
-        import flax.nnx as nnx
         import jax
         import jax.numpy as jnp
 
@@ -69,31 +111,20 @@ class Pi05JaxSystem(ProfiledSystem):
             model = model_cfg.load(params)
             ckpt_resolved = str(ckpt_dir)
 
+        # Tag the public image/LLM submodule calls with named scopes so the profiler trace is
+        # parseable into Vision/VLM/Action. Inert annotations only — no forward-pass rewrite.
+        apply_namescope_patch(model)
+
         # Dummy inputs conforming to the pi-0.5 spec (no data pipeline; timing is value-independent).
         obs = model_cfg.fake_obs(batch_size)
 
         # The exact JIT wrapper Policy uses. num_steps is passed as a (dynamic) arg, so a single
-        # compiled function serves every k in the regression — no recompilation per step count.
+        # compiled function serves any step count without recompilation.
         sample = nnx_utils.module_jit(model.sample_actions)
         key = jax.random.key(0)
 
         def infer_at(k: int):
             return lambda: sample(key, obs, num_steps=k)
-
-        # Vision-only probe: run JUST the SigLIP encoder over all camera images, exactly as
-        # embed_prefix does (one call per image). This is a minimal, direct use of the model's
-        # public vision submodule (PaliGemma.img) so we can separate Vision from VLM, which the
-        # fused XLA trace cannot. We split the model once (same pattern as module_jit) and jit it.
-        _graphdef, _state = nnx.split(model)
-        _images = obs.images
-
-        @jax.jit
-        def _vision(state):
-            m = nnx.merge(_graphdef, state)
-            return [m.PaliGemma.img(_images[name], train=False)[0] for name in _images]
-
-        def vision_infer():
-            return _vision(_state)
 
         n_images = len(obs.images)
         meta = {
@@ -122,5 +153,4 @@ class Pi05JaxSystem(ProfiledSystem):
             infer_at=infer_at,
             block=jax.block_until_ready,
             meta=meta,
-            vision_infer=vision_infer,
         )

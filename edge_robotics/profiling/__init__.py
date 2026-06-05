@@ -1,1 +1,1 @@
-"""Profiling primitives: device-synced timers, num_steps regression, JAX trace capture/parse."""
+"""Profiling primitives: device-synced wall timers + JAX trace capture/per-phase attribution."""

@@ -1,10 +1,11 @@
 """Minimal interface a profilable system must provide.
 
 Light on abstraction by design: a system just knows how to (1) load itself and (2) hand
-back a callable that runs ONE unmodified inference at a given number of denoise steps,
-plus a `block` function the timers use to force device completion. Everything phase-related
-is derived by the profiler from these callables (see edge_robotics/profiling/*), so systems
-never need to expose model internals.
+back a callable that runs ONE inference at a given number of denoise steps, plus a `block`
+function the timers use to force device completion. Phase attribution (Vision/VLM/Action) is
+derived by the profiler from the JAX trace, which the system makes parseable by tagging the
+public image/LLM submodule calls with `jax.named_scope` at load time (see systems/pi05_jax.py).
+The model's forward math is never reimplemented.
 """
 
 from __future__ import annotations
@@ -31,10 +32,6 @@ class LoadedSystem:
     infer_at: Callable[[int], Callable[[], Any]]
     block: Callable[[Any], Any]
     meta: dict[str, Any] = field(default_factory=dict)
-    # Optional: a zero-arg callable that runs ONLY the vision encoder (SigLIP) over all camera
-    # images, for the Vision-vs-VLM split (the fused profiler trace can't separate them). None
-    # if the system doesn't expose it. See edge_robotics/systems/pi05_jax.py.
-    vision_infer: Callable[[], Any] | None = None
 
     def infer(self) -> Callable[[], Any]:
         """The configured-num_steps inference callable (what E2E / trace use)."""

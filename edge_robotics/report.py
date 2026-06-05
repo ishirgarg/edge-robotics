@@ -30,19 +30,16 @@ def render_table(rows: list[PhaseRow], meta: dict) -> str:
     lines.append("  ".join(c.ljust(w) for c, w in zip(cols, widths)))
     lines.append("  ".join("-" * w for w in widths))
     for r in rows:
-        vlm_cell = _cell(r.vlm_ms, r.vlm_pct)
-        if r.vlm_ms is None and r.vision_vlm_ms is not None:
-            vlm_cell = f"{r.vision_vlm_ms:.2f} (V+VLM)"
         cells = [
             str(r.prompt_len),
             _cell(r.vision_ms, r.vision_pct),
-            vlm_cell,
+            _cell(r.vlm_ms, r.vlm_pct),
             _cell(r.action_ms, r.action_pct),
             f"{r.e2e_ms:.2f}",
             f"{r.freq_hz:.2f}",
         ]
         lines.append("  ".join(c.ljust(w) for c, w in zip(cells, widths)))
-    # notes (per row, since method/discrepancy can vary)
+    # per-row method + notes (method/discrepancy can vary by row)
     lines.append("")
     for r in rows:
         lines.append(f"  [L={r.prompt_len}] method={r.method}; {r.notes}")
@@ -54,6 +51,7 @@ def write_outputs(output_prefix: str, rows: list[PhaseRow], meta: dict) -> tuple
     json_path = f"{output_prefix}.json"
     csv_path = f"{output_prefix}.csv"
 
+    # open(..., "w") truncates, so a rerun with the same --output cleanly overwrites prior results.
     with open(json_path, "w") as f:
         json.dump({"meta": meta, "rows": [r.to_dict() for r in rows]}, f, indent=2, default=_json_default)
 
@@ -79,11 +77,6 @@ def write_outputs(output_prefix: str, rows: list[PhaseRow], meta: dict) -> tuple
                         f"{r.freq_hz:.4f}",
                         r.method,
                     ]
-                )
-            # also a combined Vision+VLM row when not split
-            if r.vision_ms is None and r.vision_vlm_ms is not None:
-                w.writerow(
-                    [r.prompt_len, r.num_steps, "vision+vlm", f"{r.vision_vlm_ms:.4f}", "", f"{r.e2e_ms:.4f}", f"{r.freq_hz:.4f}", r.method]
                 )
     return json_path, csv_path
 

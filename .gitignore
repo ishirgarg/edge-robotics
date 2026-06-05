@@ -2,8 +2,6 @@
 out/
 *.json
 *.csv
-*.nsys-rep
-*.sqlite
 
 # jax/tensorboard traces
 **/plugins/profile/
