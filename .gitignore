@@ -18,8 +18,9 @@ __pycache__/
 build/
 dist/
 
-# the cloned dependency repo (kept out of our VCS; clone separately, see README)
+# cloned dependency repos (kept out of our VCS; install.sh clones them, see README)
 /openpi/
+/realtime-vla/
 
 # env
 .env

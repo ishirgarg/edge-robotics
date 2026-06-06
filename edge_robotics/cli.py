@@ -11,11 +11,18 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
+# Backends that run on JAX/XLA. These need CUDA graphs (XLA command buffers) disabled before the
+# first `import jax` so the profiler trace keeps per-op named_scope metadata. The torch/Triton
+# backend (pi05_realtimevla) does NOT — it relies on CUDA graphs being ON for its E2E fast path.
+JAX_SYSTEMS = {"pi05_jax"}
+
+
 @dataclass
 class Config:
     # --- required identity flags (no silent defaults) ---
-    system: Literal["pi05_jax"]
-    """Which system to profile. Only pi05_jax for now."""
+    system: Literal["pi05_jax", "pi05_realtimevla"]
+    """Which system to profile: 'pi05_jax' (native JAX/Flax openpi) or 'pi05_realtimevla'
+    (dexmal/realtime-vla PyTorch+Triton)."""
     config_name: str
     """pi-0.5 config name (e.g. pi05_droid, pi05_libero, pi05_base, debug_pi05)."""
     checkpoint: str
@@ -45,6 +52,10 @@ def _make_system(name: str):
         from .systems.pi05_jax import Pi05JaxSystem
 
         return Pi05JaxSystem()
+    if name == "pi05_realtimevla":
+        from .systems.pi05_realtimevla import Pi05RealtimeVlaSystem
+
+        return Pi05RealtimeVlaSystem()
     raise ValueError(f"unknown system '{name}'")
 
 
@@ -52,29 +63,30 @@ def run(config: Config) -> None:
     import os
     import shutil
 
-    import jax
-
     from .metrics import build_row
-    from .profiling.jax_profiler import parse_trace, profile_inference
     from .profiling.walltime import time_callable
     from .report import render_table, write_outputs
 
-    n_dev = jax.device_count()
-    dev_kind = jax.devices()[0].device_kind
-    print(f"[run] jax devices: {n_dev} x {dev_kind}")
-    if n_dev != 1:
-        print(
-            f"[run] WARNING: expected exactly 1 visible GPU (set CUDA_VISIBLE_DEVICES={config.gpu}); "
-            f"got {n_dev}. Timings may be off."
-        )
-    # Phase attribution needs CUDA graphs off so kernels keep their named_scope metadata; the
-    # entrypoint sets this before importing jax. Warn loudly if it didn't take.
-    if "xla_gpu_enable_command_buffer=" not in os.environ.get("XLA_FLAGS", ""):
-        print(
-            "[run] WARNING: XLA_FLAGS lacks '--xla_gpu_enable_command_buffer=' — CUDA graphs may be "
-            "ON, which strips per-op trace metadata and breaks phase attribution. Run via "
-            "scripts/profile_policy.py (it sets this before importing jax)."
-        )
+    # JAX-only environment sanity (don't import jax for the torch/Triton backend).
+    if config.system in JAX_SYSTEMS:
+        import jax
+
+        n_dev = jax.device_count()
+        dev_kind = jax.devices()[0].device_kind
+        print(f"[run] jax devices: {n_dev} x {dev_kind}")
+        if n_dev != 1:
+            print(
+                f"[run] WARNING: expected exactly 1 visible GPU (set CUDA_VISIBLE_DEVICES={config.gpu}); "
+                f"got {n_dev}. Timings may be off."
+            )
+        # Phase attribution needs CUDA graphs off so kernels keep their named_scope metadata; the
+        # entrypoint sets this before importing jax. Warn loudly if it didn't take.
+        if "xla_gpu_enable_command_buffer=" not in os.environ.get("XLA_FLAGS", ""):
+            print(
+                "[run] WARNING: XLA_FLAGS lacks '--xla_gpu_enable_command_buffer=' — CUDA graphs may "
+                "be ON, which strips per-op trace metadata and breaks phase attribution. Run via "
+                "scripts/profile_policy.py (it sets this before importing jax)."
+            )
 
     system = _make_system(config.system)
     trace_dir = config.trace_dir or f"{config.output}_trace"
@@ -101,6 +113,7 @@ def run(config: Config) -> None:
             top_meta = {
                 "system": config.system,
                 "config_name": config.config_name,
+                "backend": loaded.meta.get("backend"),
                 "checkpoint": loaded.meta.get("checkpoint"),
                 "device_kind": loaded.meta.get("device_kind"),
                 "n_devices": loaded.meta.get("n_devices"),
@@ -108,8 +121,10 @@ def run(config: Config) -> None:
                 "batch_size": config.batch_size,
                 "warmup": config.warmup,
                 "iters": config.iters,
+                # backend-specific version key, kept under one name; jax_version retained for back-compat.
                 "jax_version": loaded.meta.get("jax_version"),
-                "attribution": "jax.named_scope trace buckets (CUDA graphs disabled)",
+                "backend_version": loaded.meta.get("jax_version") or loaded.meta.get("torch_version"),
+                "attribution": loaded.meta.get("attribution", "n/a"),
                 "model": {
                     k: loaded.meta.get(k)
                     for k in (
@@ -124,13 +139,15 @@ def run(config: Config) -> None:
                 },
             }
 
-        print("[run] timing E2E (full sample_actions)...")
+        print("[run] timing E2E (full inference)...")
         e2e_samples = time_callable(loaded.infer(), loaded.block, warmup=config.warmup, iters=config.iters)
 
         ld = os.path.join(trace_dir, f"L{L}")
-        print(f"[run] capturing JAX profiler trace -> {ld}")
-        profile_inference(loaded.infer(), loaded.block, ld, warmup=config.warmup, iters=config.iters)
-        trace = parse_trace(ld, iters=config.iters)
+        if loaded.phase_profiler is not None:
+            print(f"[run] profiling phases ({loaded.meta.get('attribution', '?')}) -> {ld}")
+            trace = loaded.phase_profiler(warmup=config.warmup, iters=config.iters, logdir=ld)
+        else:
+            trace = {"ok": False, "error": "system provides no phase_profiler"}
         if trace.get("ok"):
             p = trace["phases_ms_per_infer"]
             print(

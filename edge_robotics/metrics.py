@@ -77,7 +77,7 @@ def build_row(
     if trace is not None and trace.get("ok"):
         p = trace["phases_ms_per_infer"]
         vision_ms, vlm_ms, action_ms = p["vision"], p["vlm"], p["action"]
-        method = "trace-namescope"
+        method = trace.get("method", "trace-namescope")
 
         total = vision_ms + vlm_ms + action_ms
         if total > 0:

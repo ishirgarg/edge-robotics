@@ -18,16 +18,18 @@ import tyro
 # make `import edge_robotics` work even without `pip install -e .`
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from edge_robotics.cli import Config, _ensure_command_buffers_disabled, run  # noqa: E402
+from edge_robotics.cli import JAX_SYSTEMS, Config, _ensure_command_buffers_disabled, run  # noqa: E402
 
 
 def main() -> None:
     config = tyro.cli(Config)
-    # Must happen before the first `import jax` (which run() triggers).
+    # Must happen before the first `import jax` (which run() triggers for JAX backends).
     os.environ["CUDA_VISIBLE_DEVICES"] = str(config.gpu)
-    os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
-    # Disable CUDA graphs so the profiler trace keeps per-op named_scope metadata (phase split).
-    _ensure_command_buffers_disabled()
+    if config.system in JAX_SYSTEMS:
+        os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
+        # Disable CUDA graphs so the JAX profiler trace keeps per-op named_scope metadata (phase
+        # split). The torch/Triton backend relies on CUDA graphs being ON, so skip this for it.
+        _ensure_command_buffers_disabled()
     run(config)
 
 

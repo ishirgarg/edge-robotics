@@ -126,9 +126,21 @@ class Pi05JaxSystem(ProfiledSystem):
         def infer_at(k: int):
             return lambda: sample(key, obs, num_steps=k)
 
+        def phase_profiler(*, warmup: int, iters: int, logdir: str) -> dict:
+            """Capture a JAX profiler trace of the configured-step inference and bucket device
+            time into Vision/VLM/Action by the named_scope tags applied above."""
+            from ..profiling.jax_profiler import parse_trace, profile_inference
+
+            infer = infer_at(num_steps)
+            profile_inference(infer, jax.block_until_ready, logdir, warmup=warmup, iters=iters)
+            trace = parse_trace(logdir, iters=iters)
+            trace.setdefault("method", "trace-namescope")
+            return trace
+
         n_images = len(obs.images)
         meta = {
             "backend": "jax",
+            "attribution": "jax.named_scope trace buckets (CUDA graphs disabled)",
             "checkpoint": ckpt_resolved,
             "action_horizon": int(model_cfg.action_horizon),
             "action_dim": int(model_cfg.action_dim),
@@ -153,4 +165,5 @@ class Pi05JaxSystem(ProfiledSystem):
             infer_at=infer_at,
             block=jax.block_until_ready,
             meta=meta,
+            phase_profiler=phase_profiler,
         )
