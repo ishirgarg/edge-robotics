@@ -1,13 +1,14 @@
 #!/usr/bin/env python
-"""Entrypoint for the edge-robotics profiler.
+"""Entrypoint for the edge-robotics profiler (one system, one config, one prompt_len).
 
-Pins the GPU via CUDA_VISIBLE_DEVICES BEFORE jax is imported (tyro parsing and Config import
-are jax-free; run() imports jax lazily). Run from the repo root after `source env.sh`:
+Pins the GPU via CUDA_VISIBLE_DEVICES before any CUDA context is created (Config parsing is
+torch-free; run() imports torch lazily). Drives one of four modes (time/nsys/parse/report); the
+shell wrappers (profile_one.sh, profile_sweep.sh) sequence them and wrap the `nsys` mode under
+`nsys profile`. Run from the repo root after `source env.sh`:
 
-    python scripts/profile_policy.py --system pi05_jax --config-name pi05_droid \
-        --checkpoint gs://openpi-assets/checkpoints/pi05_droid --gpu 4 \
-        --prompt-lens 16 32 64 128 200 --num-steps 10 --warmup 3 --iters 30 \
-        --output out/pi05_droid --jax-trace
+    python scripts/profile_policy.py --system pi05_openpi_torch --config-name pi05_libero \
+        --checkpoint random --gpu 6 --prompt-len 200 --num-steps 10 --mode time \
+        --output out/run/profile
 """
 
 import os
@@ -18,18 +19,14 @@ import tyro
 # make `import edge_robotics` work even without `pip install -e .`
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from edge_robotics.cli import JAX_SYSTEMS, Config, _ensure_command_buffers_disabled, run  # noqa: E402
+from edge_robotics.cli import Config, run  # noqa: E402
 
 
 def main() -> None:
     config = tyro.cli(Config)
-    # Must happen before the first `import jax` (which run() triggers for JAX backends).
     os.environ["CUDA_VISIBLE_DEVICES"] = str(config.gpu)
-    if config.system in JAX_SYSTEMS:
-        os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
-        # Disable CUDA graphs so the JAX profiler trace keeps per-op named_scope metadata (phase
-        # split). The torch/Triton backend relies on CUDA graphs being ON, so skip this for it.
-        _ensure_command_buffers_disabled()
+    # openpi transitively imports JAX (config helpers only); keep it off the GPU.
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
     run(config)
 
 

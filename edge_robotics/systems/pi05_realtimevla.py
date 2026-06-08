@@ -1,42 +1,46 @@
 """pi-0.5 on the realtime-vla (PyTorch + Triton) backend.
 
-Profiles dexmal/realtime-vla's `Pi05Inference` — a fused-Triton reimplementation of pi-0.5 that
-runs the steady-state forward as a captured CUDA graph (`infer_graph.replay()`). We load it exactly
-the way the repo's own `benchmark.py` does and never reimplement the forward math; the only
-instrumentation mirrors `pi05_jax.apply_namescope_patch`:
+Profiles dexmal/realtime-vla's `Pi05Inference` — a fused-Triton reimplementation of pi-0.5. The repo
+captures the WHOLE forward (`pi05_model` = vision_encoder -> transformer_encoder ->
+transformer_decoder) into ONE `torch.cuda.CUDAGraph` and replays it with a single `cudaGraphLaunch`
+(`infer.forward()`), which leaves no eager phase boundaries for NVTX to grab.
 
-  * E2E  -> the real fast path: `Pi05Inference.forward()` (CUDA-graph replay). Timed wall, device-
-            synced with `torch.cuda.synchronize`.
-  * Vision / VLM / Action -> we wrap realtime-vla's three public eager stage functions
-            (`vision_encoder` / `transformer_encoder` / `transformer_decoder`, the globals
-            `pi05_model` dispatches to) with `torch.cuda.Event` timing and run the repo's own eager
-            `record_run()`. This is graphs-off (the graph replay is opaque), the exact analogue of
-            why the JAX backend disables CUDA graphs for attribution. Percentages are sound;
-            absolute per-stage ms are the eager numbers (the per-row note surfaces eager-sum vs the
-            graph E2E = the graph speedup).
+We get the SAME vision/vlm/action NVTX split as the openpi-torch backend by re-capturing the model
+as THREE separate sub-graphs — one per stage — and replaying them in eager glue with an NVTX range
+around each (graphs still ON). This is clean here because the three stages already communicate only
+through persistent in-place `buffers` (no transient allocations, no returned tensors), so splitting
+the capture is numerically identical to the single graph; only the launch count changes (3 vs 1).
+We do this from THIS wrapper without editing the vendored repo. The original single graph
+(`infer.forward`) is kept as the `infer_native` cross-check.
 
-The realtime-vla repo is vendored in-tree at <repo>/realtime-vla (cloned by install.sh) and
-imported via sys.path — it ships as copy-in files, not a pip package. Override the location with
-REALTIME_VLA_DIR if needed.
+  * infer_segmented -> [vision][vlm][action] sub-graph replays + NVTX  (headline + the split)
+  * infer_native    -> the repo's own single captured graph            (cross-check)
+  * component_profiler -> each sub-graph replayed standalone           (per-component, graphs ON)
 
-CAVEATS (see README): diffusion steps are hard-locked to 10 in realtime-vla's forward (time embeds
-are precomputed for 10), so --num-steps != 10 is ignored (warned). The Triton kernels are tuned for
-RTX 4090/5090; they run on other archs but won't hit the advertised latencies.
+nsys `nvtx_gpu_proj_sum` then attributes GPU time per phase; kernel-family buckets are also reported.
+
+The realtime-vla repo is vendored in-tree at <repo>/realtime-vla (cloned by install.sh) and imported
+via sys.path. Override with REALTIME_VLA_DIR.
+
+CAVEATS (see README): diffusion steps are hard-locked to 10 in realtime-vla's forward, so
+--num-steps != 10 is ignored (warned). The Triton kernels are tuned for RTX 4090/5090.
 """
 
 from __future__ import annotations
 
 import os
+import statistics
 import sys
+import time
 from pathlib import Path
 
 import torch
 
+from ..profiling.nsys import nvtx_range
 from .base import LoadedSystem, ProfiledSystem
 
-# Mirrors the pi05_* entries in pi05_jax.PI05_REGISTRY, mapped to realtime-vla's knobs.
-# chunk_size == action_horizon; num_views == number of camera images. The Gemma sizes are baked
-# into the Triton kernels (gemma_2b prefix + gemma_300m action expert), so they aren't selectable.
+# Mirrors the pi05_* entries in PI05_REGISTRY, mapped to realtime-vla's knobs. chunk_size ==
+# action_horizon; num_views == number of camera images. Gemma sizes are baked into the kernels.
 RT_REGISTRY: dict[str, dict] = {
     "pi05_base": dict(num_views=3, chunk_size=50, discrete_state_input=True),
     "pi05_aloha": dict(num_views=3, chunk_size=50, discrete_state_input=True),
@@ -47,26 +51,12 @@ RT_REGISTRY: dict[str, dict] = {
 _TOKENS_PER_IMAGE = 256
 _FIXED_NUM_STEPS = 10  # realtime-vla pi05 forward is hard-locked to 10 flow steps.
 
-# realtime-vla's three eager stage entrypoints -> our phase scopes. These are module globals in
-# `pi05_infer` that `pi05_model` (run by `record_run`) dispatches to, so patching the module
-# attribute is picked up without touching the forward math (cf. pi05_jax.apply_namescope_patch).
-_STAGE_SCOPE = {
-    "vision_encoder": "vision",
-    "transformer_encoder": "vlm",
-    "transformer_decoder": "action",
-}
-
-# Shared timing state for the monkeypatched wrappers. `on` gates collection so the graph-capture
-# record_run()s in Pi05Inference.__init__ aren't timed; events accumulate across the timed loop.
-_timing: dict = {"on": False, "events": {"vision": [], "vlm": [], "action": []}}
-
 
 def _realtime_vla_dir() -> Path:
     """Vendored realtime-vla checkout (repo_root/realtime-vla), overridable via REALTIME_VLA_DIR."""
     env = os.environ.get("REALTIME_VLA_DIR")
     if env:
         return Path(env).expanduser().resolve()
-    # this file: <repo>/edge_robotics/systems/pi05_realtimevla.py -> repo root is parents[2]
     return Path(__file__).resolve().parents[2] / "realtime-vla"
 
 
@@ -79,36 +69,11 @@ def _import_pi05_infer():
             f"  git clone https://github.com/dexmal/realtime-vla.git {d}\n"
             f"or set REALTIME_VLA_DIR."
         )
-    # append (not insert) to minimize shadowing of stdlib/other modules by the repo's loose files.
     if str(d) not in sys.path:
         sys.path.append(str(d))
     import pi05_infer  # noqa: PLC0415
 
     return pi05_infer
-
-
-def _apply_stage_timing_patch(pi05_infer) -> None:
-    """Wrap the three eager stage functions with cuda-event timing, once per process (sentinel)."""
-    if getattr(pi05_infer, "_edge_stage_timed", False):
-        return
-
-    def make_wrapper(orig, scope):
-        def wrapped(*args, **kwargs):
-            if not _timing["on"]:
-                return orig(*args, **kwargs)
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            out = orig(*args, **kwargs)
-            end.record()
-            _timing["events"][scope].append((start, end))
-            return out
-
-        return wrapped
-
-    for fn_name, scope in _STAGE_SCOPE.items():
-        setattr(pi05_infer, fn_name, make_wrapper(getattr(pi05_infer, fn_name), scope))
-    pi05_infer._edge_stage_timed = True
 
 
 class Pi05RealtimeVlaSystem(ProfiledSystem):
@@ -147,17 +112,14 @@ class Pi05RealtimeVlaSystem(ProfiledSystem):
         noise = torch.randn(chunk_size, 32, dtype=torch.bfloat16, device="cuda")
 
         if checkpoint == "random":
-            # benchmark.py's tokenizer-free path: provide only random language embeds; the rest of
-            # the weight buffers stay uninitialized (fine for latency). discrete_state_input=False
-            # so no tokenizer/embedding table is needed. prompt_len = #language tokens.
+            # benchmark.py's tokenizer-free path: only random language embeds; discrete_state_input
+            # =False so no tokenizer/embedding table needed. prompt_len = #language tokens.
             ckpt = {"language_embeds": torch.randn(prompt_len, 2048, dtype=torch.bfloat16, device="cuda")}
             infer = Pi05Inference(ckpt, num_views=num_views, chunk_size=chunk_size, discrete_state_input=False)
             fwd_args: tuple = (images, noise)
             ckpt_resolved = "random-init"
             discrete = False
         else:
-            # Real converted .pkl (from realtime-vla/convert_from_jax_pi05.py). EXPERIMENTAL /
-            # deferred: needs the HF paligemma-3b-pt-224 tokenizer (REALTIME_VLA_TOKENIZER).
             import pickle
 
             import numpy as np
@@ -172,68 +134,119 @@ class Pi05RealtimeVlaSystem(ProfiledSystem):
                     "to a local paligemma-3b-pt-224 dir."
                 )
             infer = Pi05Inference(
-                ckpt,
-                num_views=num_views,
-                chunk_size=chunk_size,
-                tokenizer_path=tok,
-                max_tokenize_len=prompt_len,
-                discrete_state_input=discrete,
+                ckpt, num_views=num_views, chunk_size=chunk_size, tokenizer_path=tok,
+                max_tokenize_len=prompt_len, discrete_state_input=discrete,
             )
-            if discrete:
-                fwd_args = (images, noise, "pick up the object", np.zeros(8, dtype=np.int64))
-            else:
-                fwd_args = (images, noise)
+            fwd_args = (images, noise, "pick up the object", np.zeros(8, dtype=np.int64)) if discrete else (images, noise)
             ckpt_resolved = str(checkpoint)
             print("[pi05_realtimevla] NOTE: real-weights path is experimental/unvalidated.")
 
-        def infer_at(k: int):
-            return lambda: infer.forward(*fwd_args)
+        images_in, noise_in = fwd_args[0], fwd_args[1]
+
+        # The eager input-copy from Pi05Inference.forward (lines 811-824), factored out so the
+        # captured sub-graphs only contain the *compute*, exactly like the repo's single graph (whose
+        # input copies are also eager, before replay). prompt_embeds/decoder_rope depend only on the
+        # fixed prompt, so precompute once.
+        if discrete:
+            prompt_embeds, prompt_len_actual = infer.build_prompt_embeds(
+                task_prompt=fwd_args[2], state_tokens=fwd_args[3]
+            )
+        else:
+            prompt_embeds = infer.weights["language_embeds"]
+            prompt_len_actual = prompt_embeds.shape[0]
+        _start = num_views * _TOKENS_PER_IMAGE
+        _decoder_rope = infer.get_decoder_rope_weights(prompt_len_actual)
+
+        def _fill_inputs():
+            b = infer.buffers
+            b["encoder_x"][_start : _start + prompt_len_actual].copy_(prompt_embeds)
+            b["valid_encoder_len"].fill_(_start + prompt_len_actual)
+            b["decoder_rope_weights"].copy_(_decoder_rope)
+            b["observation_images_normalized"].copy_(images_in)
+            b["diffusion_noise"].copy_(noise_in)  # decoder overwrites this in place; re-seed each run
+
+        # Re-capture the model as three per-stage sub-graphs sharing one capture pool. Warm the full
+        # pipeline first so every Triton kernel is JIT-compiled/autotuned (capture forbids that).
+        for _ in range(3):
+            pi05_infer.pi05_model(infer.weights, infer.buffers, num_views, infer.encoder_seq_len)
+        torch.cuda.synchronize()
+
+        def _capture(fn, pool=None):
+            g = torch.cuda.CUDAGraph()
+            with (torch.cuda.graph(g, pool=pool) if pool is not None else torch.cuda.graph(g)):
+                fn()
+            return g
+
+        g_vision = _capture(lambda: pi05_infer.vision_encoder(infer.weights, infer.buffers, num_views))
+        _pool = g_vision.pool()
+        g_vlm = _capture(
+            lambda: pi05_infer.transformer_encoder(infer.weights, infer.buffers, infer.encoder_seq_len), _pool
+        )
+        g_action = _capture(
+            lambda: pi05_infer.transformer_decoder(
+                infer.weights, infer.buffers, infer.encoder_seq_len, _FIXED_NUM_STEPS
+            ),
+            _pool,
+        )
+        _phase_graphs = {"vision": g_vision, "vlm": g_vlm, "action": g_action}
+
+        @torch.inference_mode()
+        def infer_segmented():
+            # Three sub-graph replays glued in eager python with NVTX around each — graphs ON, and
+            # nsys attributes each replay's kernels to its range. Numerically identical to the repo's
+            # single graph (same kernels, same persistent buffers); only the launch count differs.
+            _fill_inputs()
+            with nvtx_range("vision"):
+                g_vision.replay()
+            with nvtx_range("vlm"):
+                g_vlm.replay()
+            with nvtx_range("action"):
+                g_action.replay()
+            return infer.buffers["diffusion_noise"]
+
+        @torch.inference_mode()
+        def infer_native():
+            # The repo's own single captured graph — cross-check for the segmented wall.
+            return infer.forward(*fwd_args)
 
         def block(_out):
             torch.cuda.synchronize()
 
-        def phase_profiler(*, warmup: int, iters: int, logdir: str | None = None) -> dict:
-            """Vision/VLM/Action via cuda-event timing of the eager Triton stages (graphs off).
-            `logdir` is unused (no trace files for this backend)."""
-            _apply_stage_timing_patch(pi05_infer)
-            # Drive a realistic workload into the buffers + warm the eager kernels (timing off).
-            for _ in range(max(warmup, 1)):
-                infer.forward(*fwd_args)
-            for _ in range(2):
-                infer.record_run()
-            torch.cuda.synchronize()
-
-            ev = _timing["events"]
-            for v in ev.values():
-                v.clear()
-            _timing["on"] = True
-            try:
-                for _ in range(iters):
-                    infer.record_run()
-                torch.cuda.synchronize()
-            finally:
-                _timing["on"] = False
-
+        def component_profiler(*, warmup: int, iters: int, logdir: str | None = None) -> dict:
+            """Time each stage sub-graph standalone (graphs ON). Buffers persist across replays, so a
+            stage can be replayed in isolation once the pipeline has been primed."""
             n = max(int(iters), 1)
-            per = {
-                s: (sum(a.elapsed_time(b) for a, b in evs) / n if evs else 0.0)
-                for s, evs in ev.items()
-            }
-            total = per["vision"] + per["vlm"] + per["action"]
+            with torch.inference_mode():
+                _fill_inputs()
+                for _ in range(max(warmup, 1)):
+                    g_vision.replay()
+                    g_vlm.replay()
+                    g_action.replay()
+                torch.cuda.synchronize()
+
+                def _time(graph) -> float:
+                    xs = []
+                    for _ in range(n):
+                        t0 = time.perf_counter()
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        xs.append((time.perf_counter() - t0) * 1000.0)
+                    return statistics.median(xs)
+
+                per = {name: _time(g) for name, g in _phase_graphs.items()}
+            total = sum(per.values())
             return {
                 "ok": total > 0,
-                "method": "eager-stage-timing",
-                "phases_ms_per_infer": {"vision": per["vision"], "vlm": per["vlm"], "action": per["action"]},
-                "residual_ms_per_infer": 0.0,  # pi05_model == exactly these three stages
+                "method": "standalone-subgraph-replay-wall",
+                "phases_ms_per_infer": per,
                 "total_gpu_ms_per_infer": total,
-                "attributed_frac": 1.0,
-                "top_kernels": [],
-                "error": None if total > 0 else "no stage events captured",
+                "error": None if total > 0 else "no component timings",
             }
 
         meta = {
             "backend": "torch-triton",
-            "attribution": "cuda-event timing of eager Triton stages (graphs off); E2E = CUDA-graph replay",
+            "attribution": "nsys NVTX GPU projection over per-stage CUDA sub-graphs (graphs ON); "
+            "E2E = segmented sub-graph replays (single captured graph reported as cross-check)",
             "checkpoint": ckpt_resolved,
             "discrete_state_input": discrete,
             "action_horizon": chunk_size,
@@ -246,6 +259,7 @@ class Pi05RealtimeVlaSystem(ProfiledSystem):
             "action_expert_variant": "gemma_300m",
             "dtype": "bfloat16",
             "num_steps_fixed": _FIXED_NUM_STEPS,
+            "graphs_on": True,
             "device_kind": torch.cuda.get_device_name(0),
             "n_devices": 1,
             "torch_version": torch.__version__,
@@ -258,8 +272,10 @@ class Pi05RealtimeVlaSystem(ProfiledSystem):
             prompt_len=prompt_len,
             num_steps=_FIXED_NUM_STEPS,
             batch_size=batch_size,
-            infer_at=infer_at,
+            infer_segmented=infer_segmented,
             block=block,
+            nvtx_phases=("vision", "vlm", "action"),
+            infer_native=infer_native,
+            component_profiler=component_profiler,
             meta=meta,
-            phase_profiler=phase_profiler,
         )

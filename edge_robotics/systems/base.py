@@ -1,17 +1,22 @@
 """Minimal interface a profilable system must provide.
 
-Light on abstraction by design: a system just knows how to (1) load itself and (2) hand
-back a callable that runs ONE inference at a given number of denoise steps, plus a `block`
-function the timers use to force device completion.
+Light on abstraction by design. The profiler runs the model in its REAL graphs-on form and uses
+nvidia/CUDA tooling (Nsight Systems) to attribute time — it never runs the model eager just to see
+inside it. A loaded system therefore exposes up to three graphs-on callables plus metadata:
 
-Phase attribution (Vision/VLM/Action) is the SYSTEM's responsibility, exposed via the optional
-`phase_profiler` callable on `LoadedSystem` — the orchestration loop (cli.run) is framework-agnostic
-and just calls it. Each backend instruments its own forward without reimplementing the math:
-  * pi05_jax       -> JAX profiler trace bucketed by `jax.named_scope` (CUDA graphs off).
-  * pi05_realtimevla -> CUDA-event timing around the eager Triton stage fns (graphs off for the
-                        split; the graph path is still used for E2E).
-Both return the same dict shape (see profiling/jax_profiler.py:parse_trace) so metrics.build_row
-treats them uniformly.
+  * `infer_segmented` — the headline E2E inference, structured so a single nsys capture can be
+    split per component. For the torch backend this is the model run as SEPARATELY-compiled
+    per-phase CUDA graphs glued in eager python, each wrapped in an NVTX range (vision / vlm /
+    action). nsys `nvtx_gpu_proj_sum` then attributes GPU time per phase. (See profiling/nsys.py
+    for why per-phase graphs + eager NVTX is the only thing that survives CUDA graphs.)
+  * `infer_native` — OPTIONAL cross-check: the model's own single fused torch.compile path. Same
+    result, no NVTX split; the wall gap vs `infer_segmented` is the segmentation overhead.
+  * `component_profiler` — OPTIONAL: time each component standalone in its fully-optimized
+    (graphs-on) form, returning ms/infer per phase. Independent of the E2E NVTX split.
+
+`nvtx_phases` lists the NVTX range names the segmented path emits (empty for an opaque fused graph
+that can't be split, e.g. realtime-vla — that backend degrades to kernel-family buckets only).
+`block(out)` forces device completion for honest wall timing.
 """
 
 from __future__ import annotations
@@ -24,28 +29,23 @@ from typing import Any
 
 @dataclass
 class LoadedSystem:
-    """A loaded model ready to profile.
-
-    infer_at(k) -> a zero-arg callable that runs one full inference with k denoise steps and
-    returns device array(s) (NOT yet synced). `block(out)` forces completion (jax.block_until_ready).
-    """
+    """A loaded model ready to profile, in its real graphs-on form."""
 
     name: str
     config_name: str
     prompt_len: int
     num_steps: int
     batch_size: int
-    infer_at: Callable[[int], Callable[[], Any]]
+    # Headline graphs-on E2E. For the torch backend this emits NVTX phase ranges so one nsys
+    # capture yields the component split; it is ALSO the callable timed for the headline wall.
+    infer_segmented: Callable[[], Any]
     block: Callable[[Any], Any]
+    nvtx_phases: tuple[str, ...] = ()
+    # Optional cross-check: the model's native single-compile E2E (no NVTX split).
+    infer_native: Callable[[], Any] | None = None
+    # Optional per-component standalone graphs-on timing: component_profiler(warmup, iters) -> dict.
+    component_profiler: Callable[..., dict] | None = None
     meta: dict[str, Any] = field(default_factory=dict)
-    phase_profiler: Callable[..., dict] | None = None
-    """Backend-specific Vision/VLM/Action attribution. Called as
-    `phase_profiler(warmup=int, iters=int, logdir=str) -> dict` (parse_trace shape). When None,
-    the row degrades to E2E/Freq only."""
-
-    def infer(self) -> Callable[[], Any]:
-        """The configured-num_steps inference callable (what E2E / trace use)."""
-        return self.infer_at(self.num_steps)
 
 
 class ProfiledSystem(abc.ABC):

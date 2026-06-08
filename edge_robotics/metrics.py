@@ -1,22 +1,21 @@
-"""Turn raw measurements into the 5-metric row: Vision/VLM/Action (ms & %), E2E (ms), Freq (Hz).
+"""Assemble the per-run result from the graphs-on measurements.
 
-How each number is derived:
-  - E2E (ms)  : median of device-synced steady-state wall times of the full sample_actions.
-  - Freq (Hz) : 1000 / E2E.
-  - Vision / VLM / Action : GPU device time per phase, summed from the JAX profiler trace by
-    `jax.named_scope` tag (see profiling/jax_profiler.py). This is a DIRECT measurement, not an
-    inferred split.
-  - %         : each phase as a share of (Vision + VLM + Action).
-  - residual  : device time outside any phase scope (input transpose, noise sampling, the
-    x_t+dt*v_t update, action_out_proj, D2D copies). Reported, not hidden.
+One run == one (system, config, prompt_len). The result carries, all from the model's REAL
+graphs-on form:
 
-If the trace is unavailable/unparseable the row degrades to E2E/Freq only.
+  - e2e_segmented : device-synced wall of the per-phase-graph E2E (headline). freq = 1000/median.
+  - e2e_native    : wall of openpi's native single-compile E2E (cross-check; may be absent). The
+                    gap segmented-vs-native is the segmentation overhead of running phases as
+                    separate graphs (the price of an NVTX-attributable breakdown).
+  - breakdown_nvtx: GPU ms/infer per phase from nsys NVTX GPU projection (the component split).
+  - kernel_buckets: GPU ms/infer per kernel family from nsys (graph-safe; the only split for an
+                    opaque fused graph).
+  - components_standalone: each phase timed standalone in its graphs-on form (independent of E2E).
+
+Anything not measured (e.g. no nsys rep yet) is left None; nothing is inferred.
 """
 
 from __future__ import annotations
-
-from dataclasses import asdict, dataclass, field
-from typing import Any
 
 import numpy as np
 
@@ -36,85 +35,69 @@ def stats(samples_ms: list[float]) -> dict:
     }
 
 
-@dataclass
-class PhaseRow:
-    prompt_len: int
-    num_steps: int
-    e2e_ms: float
-    freq_hz: float
-    vision_ms: float | None
-    vlm_ms: float | None
-    action_ms: float | None
-    vision_pct: float | None
-    vlm_pct: float | None
-    action_pct: float | None
-    method: str
-    notes: str = ""
-    e2e_stats: dict = field(default_factory=dict)
-    trace: dict | None = None
-    meta: dict = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        return asdict(self)
+def _pct_split(phases_ms: dict) -> dict:
+    total = sum(v for v in phases_ms.values() if v)
+    if total <= 0:
+        return {k: None for k in phases_ms}
+    return {k: 100.0 * v / total for k, v in phases_ms.items()}
 
 
-def build_row(
+def build_result(
     *,
-    prompt_len: int,
-    num_steps: int,
-    e2e_samples: list[float],
-    trace: dict | None,
-    meta: dict,
-) -> PhaseRow:
-    est = stats(e2e_samples)
-    e2e_ms = est["median"]
-    freq_hz = 1000.0 / e2e_ms if e2e_ms > 0 else float("nan")
+    e2e_segmented: list[float] | None,
+    e2e_native: list[float] | None,
+    breakdown_nvtx: dict | None,
+    kernel_buckets: dict | None,
+    components_standalone: dict | None,
+) -> dict:
+    """Combine whatever measurements are present into one JSON-serializable result dict."""
+    res: dict = {}
 
-    vision_ms = vlm_ms = action_ms = None
-    vision_pct = vlm_pct = action_pct = None
-    notes_parts: list[str] = []
+    if e2e_segmented:
+        seg = stats(e2e_segmented)
+        res["e2e_segmented_ms"] = seg
+        res["freq_hz"] = 1000.0 / seg["median"] if seg["median"] > 0 else float("nan")
+    if e2e_native:
+        res["e2e_native_ms"] = stats(e2e_native)
 
-    if trace is not None and trace.get("ok"):
-        p = trace["phases_ms_per_infer"]
-        vision_ms, vlm_ms, action_ms = p["vision"], p["vlm"], p["action"]
-        method = trace.get("method", "trace-namescope")
+    seg_med = res.get("e2e_segmented_ms", {}).get("median")
+    nat_med = res.get("e2e_native_ms", {}).get("median")
+    if seg_med and nat_med:
+        res["segmentation_overhead_pct"] = 100.0 * (seg_med / nat_med - 1.0)
 
-        total = vision_ms + vlm_ms + action_ms
-        if total > 0:
-            vision_pct = 100.0 * vision_ms / total
-            vlm_pct = 100.0 * vlm_ms / total
-            action_pct = 100.0 * action_ms / total
+    if breakdown_nvtx is not None and breakdown_nvtx.get("ok"):
+        p = breakdown_nvtx["phases_ms_per_infer"]
+        res["breakdown_nvtx"] = {
+            "phases_ms_per_infer": p,
+            "phases_pct": _pct_split(p),
+            "attributed_frac": breakdown_nvtx.get("attributed_frac"),
+            "residual_ms_per_infer": breakdown_nvtx.get("residual_ms_per_infer"),
+            "total_gpu_ms_per_infer": breakdown_nvtx.get("total_gpu_ms_per_infer"),
+            "method": breakdown_nvtx.get("method"),
+        }
+    elif breakdown_nvtx is not None:
+        res["breakdown_nvtx_error"] = breakdown_nvtx.get("error")
 
-        # Trustworthiness signals: how much GPU time was attributable, and how the summed device
-        # time compares to the measured wall E2E.
-        frac = trace.get("attributed_frac")
-        if frac is not None and frac < 0.90:
-            notes_parts.append(f"only {frac*100:.1f}% of GPU time attributed (CUDA graphs on?)")
-        residual = trace.get("residual_ms_per_infer", 0.0)
-        gpu_total = trace.get("total_gpu_ms_per_infer", total + residual)
-        notes_parts.append(f"residual(non-phase)={residual:.3f}ms")
-        if e2e_ms > 0:
-            disc = abs(gpu_total - e2e_ms) / e2e_ms * 100.0
-            notes_parts.append(f"GPU_total={gpu_total:.3f}ms vs E2E={e2e_ms:.3f}ms ({disc:.1f}% diff)")
-    else:
-        method = "e2e-only"
-        err = (trace or {}).get("error", "no trace")
-        notes_parts.append(f"no usable trace ({err}): only E2E/Freq available")
+    if kernel_buckets is not None and kernel_buckets.get("ok"):
+        b = kernel_buckets["buckets_ms_per_infer"]
+        res["kernel_buckets"] = {
+            "buckets_ms_per_infer": b,
+            "buckets_pct": _pct_split(b),
+            "total_gpu_ms_per_infer": kernel_buckets.get("total_gpu_ms_per_infer"),
+            "top_kernels": kernel_buckets.get("top_kernels", []),
+            "method": kernel_buckets.get("method"),
+        }
+    elif kernel_buckets is not None:
+        res["kernel_buckets_error"] = kernel_buckets.get("error")
 
-    return PhaseRow(
-        prompt_len=prompt_len,
-        num_steps=num_steps,
-        e2e_ms=e2e_ms,
-        freq_hz=freq_hz,
-        vision_ms=vision_ms,
-        vlm_ms=vlm_ms,
-        action_ms=action_ms,
-        vision_pct=vision_pct,
-        vlm_pct=vlm_pct,
-        action_pct=action_pct,
-        method=method,
-        notes="; ".join(notes_parts),
-        e2e_stats=est,
-        trace=trace,
-        meta=meta,
-    )
+    if components_standalone is not None and components_standalone.get("ok"):
+        p = components_standalone["phases_ms_per_infer"]
+        res["components_standalone"] = {
+            "phases_ms_per_infer": p,
+            "phases_pct": _pct_split(p),
+            "method": components_standalone.get("method"),
+        }
+    elif components_standalone is not None:
+        res["components_standalone_error"] = components_standalone.get("error")
+
+    return res

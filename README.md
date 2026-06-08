@@ -1,64 +1,87 @@
 # edge-robotics
 
 Profiler-driven latency study for robotics foundation models **at the edge**. It profiles
-**pi-0.5** on a single GPU and reports a per-phase breakdown:
+**pi-0.5** on a single GPU, running the model **only in its real, fully-optimized CUDA-graphs-on
+form**, and attributes time to each component with **NVIDIA Nsight Systems (nsys)** — never by
+re-running the model eager to peek inside it.
 
-| Vision (ms / %) | VLM (ms / %) | Action (ms / %) | E2E (ms) | Freq (Hz) |
+For each run it reports:
 
-Two backends are profiled as **separate models** (pick with `--system`):
+- **E2E (ms / Freq)** — wall latency of the full inference (graphs on).
+- **Component breakdown** — Vision / VLM / Action GPU time from a single nsys capture.
+- **Per-component standalone** — each component timed on its own, also fully optimized (graphs on).
 
-| `--system` | what | phase attribution |
-|------------|------|-------------------|
-| `pi05_jax` | native JAX/Flax, from [openpi](https://github.com/Physical-Intelligence/openpi) | JAX profiler trace bucketed by `jax.named_scope` (CUDA graphs off) |
-| `pi05_realtimevla` | PyTorch + Triton, from [dexmal/realtime-vla](https://github.com/dexmal/realtime-vla) (fused kernels + CUDA-graph replay) | `torch.cuda.Event` timing of the eager Triton stages (graphs off); E2E from the graph |
+Two backends (pick with `--system`):
 
-In both, the model's forward math is run **unmodified** on dummy, spec-conformant inputs — the only
-instrumentation is inert timing annotations around the public stages. Phase timings are a **direct
-measurement**, not a `num_steps` regression or statistical inference. The same task variant on the
-two backends is one "model" each, e.g. `out/pi05_droid` (JAX) vs `out/pi05_droid_realtimevla`.
+| `--system` | what | component attribution |
+|------------|------|-----------------------|
+| `pi05_openpi_torch` | openpi's native **PyTorch** port (`PI0Pytorch`) | **nsys NVTX GPU projection** over per-phase CUDA graphs — clean Vision/VLM/Action split, graphs ON |
+| `pi05_realtimevla` | PyTorch + Triton, from [dexmal/realtime-vla](https://github.com/dexmal/realtime-vla) (fused Triton kernels + CUDA-graph replay) | **same NVTX split** — we re-capture its single graph as three per-stage sub-graphs (bitwise-identical to native), plus kernel-family buckets |
+
+> The JAX backend was removed. This repo now profiles the two PyTorch paths.
 
 ---
 
 ## How latency is measured (read this)
 
-One pi-0.5 inference = **Vision** (SigLIP image encode) → **VLM** (Gemma prefill, builds the
-KV-cache) → **Action** (the `jax.lax.while_loop` flow-matching denoise loop, `num_steps` iters).
+One pi-0.5 inference = **Vision** (SigLIP image encode ×3) → **VLM** (Gemma-2b prefill, builds the
+KV-cache) → **Action** (flow-matching denoise loop, `num_steps` × Gemma-300m action expert).
 
-- **E2E (ms)** — median steady-state **wall** time of the full `sample_actions`. **Freq = 1000/E2E.**
-  Timing is **device-synced**: every measured region ends with `jax.block_until_ready`, so we time
-  real GPU completion, not async dispatch. Warmup iterations absorb JIT compilation.
-- **Vision / VLM / Action (ms, %)** — **GPU device time per phase, read straight off the JAX
-  profiler trace.** At load time we wrap the two public submodule calls in `jax.named_scope`
-  (`edge_robotics/systems/pi05_jax.py:apply_namescope_patch`):
-  `PaliGemma.img → "vision"`, and `PaliGemma.llm → "vlm"` (prefix prefill, no kv-cache) or
-  `"action"` (denoise step, with kv-cache). These are inert annotations — the forward pass is
-  never reimplemented. `parse_trace` then sums each GPU event's `dur` by the scope tag carried in
-  its `args["name"]` path (e.g. `…/vision/…`). **%** is each phase's share of (Vision+VLM+Action).
-- **Why CUDA graphs are disabled** — the profiler can only attribute per-op time if kernels keep
-  their metadata. With XLA command buffers on, the bulk of kernels are captured into CUDA graphs
-  that strip per-op names, and attribution collapses to ~0%. The entrypoint therefore sets
-  `XLA_FLAGS=--xla_gpu_enable_command_buffer=` **before importing jax**. (Trade-off: this adds a
-  little kernel-launch overhead, so E2E here is marginally above a graphs-on deployment.)
-- **Trustworthiness signals** (printed per row): `attributed_frac` (share of GPU time that landed
-  in a phase — typically ~97%; the small remainder is inter-phase glue: input transpose, noise
-  sampling, the `x_t+dt·v_t` update, `action_out_proj`, D2D copies), `residual` ms, and
-  `GPU_total` (summed device time) vs measured wall `E2E`.
+### Why the model is restructured into per-phase graphs
 
-The raw trace is kept under `<output>_trace/L<n>/…`; view it with `tensorboard --logdir <output>_trace`.
+openpi compiles `sample_actions` as **one** `torch.compile` unit (a single fused CUDA graph). NVTX
+ranges pushed at the python level **cannot** attribute kernels *inside* a single fused graph: the
+whole thing launches under one `cudaGraphLaunch` that falls outside any NVTX window opened at replay
+time, so the split collapses (verified empirically — the NVTX ranges come back essentially empty).
 
----
+The fix — the only thing that survives CUDA graphs — is to run the three phases as **separately
+compiled / cudagraph callables glued in eager python**, with the NVTX range pushed **around** each
+call (never inside a compiled region). nsys `nvtx_gpu_proj_sum` then attributes GPU device time per
+phase. Cross-phase tensors (prefix embeds, the KV cache, masks, state) are `.clone()`d out of each
+graph's static pool, and `cudagraph_mark_step_begin()` is called before each graph invocation, as
+CUDA-graph trees require. This is what `infer_segmented` in
+`edge_robotics/systems/pi05_openpi_torch.py` does.
 
-## Hardware note
+Validated on the real model (pi05_libero, A6000, graphs on): the per-phase NVTX projection sums to
+**~99%** of E2E, and the segmented path's wall time is **within noise of** openpi's native
+single-compile path — so segmenting buys an attributable breakdown at no measurable latency cost.
 
-The request said "RTX 6000"; this machine actually has **8× NVIDIA RTX A6000 (48 GB)**.
-We pin to one GPU via `--gpu`. (GPU occupancy varies — check `nvidia-smi` for a free device;
-a real ~3B pi-0.5 checkpoint needs the GPU to be mostly idle, the tiny `debug_pi05` fits anywhere.)
+### The numbers
 
-## Layout note (disk)
+- **E2E (segmented, headline)** — median device-synced **wall** time of the per-phase-graph
+  inference. **Freq = 1000/E2E.** Warmup absorbs `torch.compile` + cudagraph capture.
+- **E2E (native, cross-check)** — the **faithful, fully-optimized repo baseline**, exactly as each
+  repo ships it: openpi → `torch.compile(sample_actions, mode="max-autotune")` (openpi's own
+  `Pi0Config` default); realtime-vla → its single captured CUDA graph (`infer.forward`, the
+  `benchmark.py` path). The gap vs segmented is the segmentation overhead (≈0 when both use the same
+  mode). The segmented breakdown defaults to `reduce-overhead` for fast compiles
+  (`OPENPI_TORCH_COMPILE_MODE`); the native baseline keeps `max-autotune`
+  (`OPENPI_TORCH_NATIVE_COMPILE_MODE`) so it stays faithful to the original.
+- **Component breakdown** — GPU ms/infer per phase from nsys `nvtx_gpu_proj_sum`. `%` is each
+  phase's share. `attributed_frac` (share of GPU time landing in a phase) and `residual` (inter-phase
+  glue: noise sampling, the `x_t+dt·v_t` update, D2D copies) are reported, not hidden.
+- **Per-component standalone** — each phase timed in isolation, fully optimized (graphs on), with the
+  upstream inputs precomputed once and reused.
+- **Kernel-family buckets** (`pi05_realtimevla`, and also available for openpi-torch) — every GPU
+  kernel classified by name into attention / gemm / conv / elementwise / other. Graph-safe (nsys
+  reports real kernel names even inside graphs). Heuristic — always sanity-check the `other` bucket.
 
-Home here is only ~20 GB, so the conda env, checkpoints, and pip cache live on **`/scratch`**
-(see `env.sh`). Project code stays in this folder. The `openpi/` and `realtime-vla/` dependencies
-are cloned in-tree but **git-ignored** — they aren't shipped with this repo; `install.sh` pulls them.
+### The four stages (one nsys capture, clean wall numbers)
+
+Because nsys must wrap the whole process (and CUPTI perturbs wall timing), one profiling run is split
+into cheap stages the shell sequences (`--mode`):
+
+1. **time** — pristine wall: segmented E2E (headline) + per-component standalone → `<out>.timing.json`
+2. **time-native** — openpi's native single-compile E2E, in its OWN process (cross-check) →
+   `<out>.timing-native.json`. Separate because the native fused graph and the per-phase graphs
+   thrash the shared cudagraph pool if run together (dynamo recompiles every call). Skip with
+   `CROSS_CHECK_NATIVE=0`.
+3. **nsys** — bracket one steady-state segmented run UNDER `nsys profile` → `<out>.nsys-rep`
+4. **parse** — NVTX split + kernel buckets from the report → `<out>.breakdown.json`
+5. **report** — merge → `<out>.json` / `<out>.csv` (+ printed summary)
+
+`--capture-range=cudaProfilerApi` means nsys records **only** between `cudaProfilerStart/Stop` (which
+the python brackets), so model load, compile, cudagraph capture and warmup are excluded.
 
 ---
 
@@ -66,127 +89,99 @@ are cloned in-tree but **git-ignored** — they aren't shipped with this repo; `
 
 ```bash
 cd /home/eecs/ishirgarg/edge-robotics
-
-# 1. clone the openpi dependency in-tree. It MUST exist before env create —
-#    environment.yml installs `-e ./openpi/packages/openpi-client`. (install.sh
-#    also auto-clones openpi as a fallback, but that runs after env create.)
-GIT_LFS_SKIP_SMUDGE=1 git clone --recurse-submodules \
-    https://github.com/Physical-Intelligence/openpi.git openpi
-
-# 2. create the env (python 3.11 + JAX/torch stack; skips openpi's heavy unused deps)
-GIT_LFS_SKIP_SMUDGE=1 conda env create -f environment.yml
-
-# 3. finish: editable openpi + edge_robotics (--no-deps) + sanity import.
-#    Also auto-clones realtime-vla (and openpi, if step 1 was skipped).
-conda activate edge-robotics
 bash install.sh
 ```
 
-Both `openpi/` and `realtime-vla/` are git-ignored — they're cloned by the steps above,
-never committed to this repo.
+`install.sh` is idempotent: clones `openpi` and `realtime-vla` in-tree (both git-ignored, never
+committed), creates the `edge-robotics` conda env from `environment.yml`, installs `openpi` +
+`edge_robotics` editable `--no-deps`, copies openpi's patched transformers (`transformers_replace`,
+required by `PI0Pytorch`), and sanity-checks imports.
 
-`environment.yml` pins the subset of openpi's deps needed for JAX inference and deliberately
-omits `lerobot`/`tensorflow`/`gym-aloha`/`dlimp` (only used for data-loading/training).
-`install.sh` does `pip install --no-deps -e ./openpi` so those omitted deps aren't pulled.
+> openpi is still a dependency (the PyTorch port lives in it and pulls JAX for config helpers only —
+> `JAX_PLATFORMS=cpu` keeps JAX off the GPU). Override realtime-vla's location with `REALTIME_VLA_DIR`.
 
-`install.sh` also clones [dexmal/realtime-vla](https://github.com/dexmal/realtime-vla) in-tree
-(for the `pi05_realtimevla` backend). It's imported via `sys.path` (copy-in files, not a package)
-and needs only `torch`/`triton`/`transformers`, already in the env. Override its location with
-`REALTIME_VLA_DIR`.
+`nsys` must be available — on PATH or at `/usr/local/cuda-*/bin/nsys` (the scripts auto-detect it).
 
 ---
 
 ## Usage
 
 ```bash
-source env.sh   # activate env + point caches (checkpoints, etc.) at /scratch
+source env.sh   # activate env + point caches at /scratch + JAX_PLATFORMS=cpu
 
-# prompt-length sweep on an idle GPU, real DROID checkpoint:
-python scripts/profile_policy.py \
-  --system pi05_jax \
-  --config-name pi05_droid \
-  --checkpoint gs://openpi-assets/checkpoints/pi05_droid \
-  --gpu 4 \
-  --prompt-lens 16 32 64 128 200 \
-  --num-steps 10 --warmup 3 --iters 30 --batch-size 1 \
-  --output out/pi05_droid
+# one system, one config, one prompt length (all four stages, end to end):
+./profile_one.sh pi05_openpi_torch pi05_libero 200 6 out/libero_torch_L200
+#                <system>          <config>     <L> <gpu> <out_dir>
 ```
 
-Fast plumbing test with no download (tiny dummy model, random weights):
+Env overrides for `profile_one.sh`: `CHECKPOINT` (default `random`), `NUM_STEPS` (10), `WARMUP` (3),
+`ITERS` (20), `BATCH_SIZE` (1), `OPENPI_TORCH_COMPILE_MODE`.
+
+`OPENPI_TORCH_COMPILE_MODE`: `reduce-overhead` (default — CUDA graphs, compiles fast),
+`max-autotune` (openpi's default — also graphs, compiles for many minutes), or `none`/`eager`
+(graphs off; the NVTX split won't be available).
+
+### Sweep over backends × prompt lengths
 
 ```bash
-python scripts/profile_policy.py --system pi05_jax --config-name debug_pi05 \
-  --checkpoint random --gpu 4 --prompt-lens 32 128 --num-steps 10 \
-  --warmup 2 --iters 5 --output out/smoke
+./profile_sweep.sh        # edit SYSTEMS / CONFIG_NAME / PROMPT_LENS / GPU at the top
 ```
 
-### realtime-vla backend (PyTorch + Triton)
-
-Same CLI, `--system pi05_realtimevla`. The smoke path needs **no checkpoint and no tokenizer**
-(random weights + random language embeds, exactly like realtime-vla's `benchmark.py`):
-
-```bash
-python scripts/profile_policy.py \
-  --system pi05_realtimevla \
-  --config-name pi05_droid \
-  --checkpoint random \
-  --gpu 4 \
-  --prompt-lens 16 32 64 128 200 \
-  --num-steps 10 --warmup 3 --iters 30 \
-  --output out/pi05_droid_realtimevla
-```
-
-Caveats for this backend (see also the `out/*.json` `meta`):
-
-- **E2E is CUDA-graph replay (the fast path); the phase split is from the eager `record_run()`**
-  (graphs off — graph replay is opaque). Percentages are sound; absolute per-stage ms are the eager
-  numbers, so eager-sum > graph E2E (the per-row note shows this gap = the graph speedup). This is
-  the same trade-off the JAX backend makes by disabling graphs for attribution.
-- **Flow steps are hard-locked to 10** in realtime-vla's forward; `--num-steps != 10` is ignored.
-- **Triton kernels are tuned for RTX 4090/5090**; they run on other GPUs (e.g. A6000) but won't hit
-  the advertised latencies.
-- **Real weights** (`--checkpoint <converted.pkl>`) need the HF-gated `paligemma-3b-pt-224`
-  tokenizer (`REALTIME_VLA_TOKENIZER`) and a `.pkl` from `realtime-vla/convert_from_jax_pi05.py`.
-  This path is implemented but experimental/unvalidated; the smoke path above is the supported one.
-
-Reruns are self-overwriting: the same `--output` truncates `<output>.{json,csv}` and the whole
-`<output>_trace/` dir is wiped at startup, so stale results from a previous run never linger.
-
-### Key flags
-
-| flag | meaning |
-|------|---------|
-| `--config-name` | `pi05_droid` (ah=15), `pi05_libero` (ah=10), `pi05_base`/`pi05_aloha` (ah=50), `debug_pi05` (tiny) |
-| `--checkpoint` | `gs://…` URI, local path, or `random` (random-init, no download) |
-| `--gpu` | CUDA index to pin |
-| `--prompt-lens` | `max_token_len` values to sweep (the pi-0.5 prompt-length knob) |
-| `--num-steps` | flow-matching denoise steps |
-| `--warmup` / `--iters` | warmup (compile) and timed iterations per measurement |
-| `--batch-size` | inference batch size |
-| `--trace-dir` | where to write JAX traces (default `<output>_trace`; wiped per run) |
-
-The JAX profiler trace (with CUDA graphs disabled for attribution) is always captured — it *is*
-the phase measurement, not an optional artifact.
-
-### Outputs
-
-- stdout: the 5-metric table (one row per prompt length) + per-row method/notes.
-- `<output>.json`: full E2E stats (mean/median/p50/p90/p99/std), per-phase trace buckets +
-  residual + attributed fraction + top kernels, and run metadata.
-- `<output>.csv`: one row per `(prompt_len, phase)` for plotting.
-- `<output>_trace/L<n>/…`: raw JAX traces; view via `tensorboard --logdir <output>_trace`.
-
+`profile_sweep.sh` just loops `profile_one.sh` (the one-config unit of work) sequentially on one GPU.
 Why prompt length matters: it sets the padded token-sequence length (`max_token_len`); the LLM
 processes all padded positions, so larger prompts grow the VLM prefill (~quadratic in
-`768 + max_token_len`) and each Action step (attends over the cached prefix), while Vision stays
-flat — surfacing how the bottleneck shifts.
+`768 + max_token_len`) and each Action step (attends over the cached prefix), while Vision stays flat.
+
+### Run a single stage directly
+
+```bash
+python scripts/profile_policy.py --system pi05_openpi_torch --config-name pi05_libero \
+  --checkpoint random --gpu 6 --prompt-len 200 --mode time --output out/x/profile
+```
+
+### realtime-vla backend
+
+Same `profile_one.sh`, `--system pi05_realtimevla`. The smoke path needs **no checkpoint and no
+tokenizer** (random weights + random language embeds, like realtime-vla's `benchmark.py`). Caveats
+(see also `out/*.json` `meta`):
+
+- The repo captures the **whole** forward as one CUDA graph. We get the Vision/VLM/Action split by
+  re-capturing it as **three per-stage sub-graphs** (the stages talk only through persistent in-place
+  buffers, so this is **bitwise-identical** to their single graph — verified — and adds ~0 overhead).
+  Their original single graph is kept as the `infer_native` cross-check.
+- **Flow steps are hard-locked to 10**; `--num-steps != 10` is ignored.
+- **Triton kernels are tuned for RTX 4090/5090**; they run on A6000 etc. but won't hit advertised latencies.
+- **Real weights** (`--checkpoint <converted.pkl>`) need the HF-gated `paligemma-3b-pt-224` tokenizer
+  (`REALTIME_VLA_TOKENIZER`); experimental/unvalidated.
 
 ---
 
+## Outputs
+
+- stdout: a per-run summary (E2E segmented + native, component breakdown, per-component standalone, buckets).
+- `<out>/config.json`: **full reproducibility manifest** — hardware target (GPU name, compute
+  capability, memory, UUID, driver + CUDA versions), `model_weight_dtype` (e.g. `bfloat16`), model
+  config (variants, dims, prompt/horizon), compile modes, all package versions
+  (torch/triton/transformers/openpi/jax/numpy/nsys), git commit + dirty flag, the invocation, and the
+  result-affecting env vars. (Same `meta` the results carry, written as its own file.)
+- `<out>/profile.json`: `meta` (= the manifest above) + `result` (E2E stats mean/median/p50/p90/p99,
+  segmentation overhead, NVTX per-phase ms/%, kernel buckets + top kernels, per-component standalone ms).
+- `<out>/profile.csv`: long format — one row per `(metric, phase)` for plotting across a sweep.
+- `<out>/profile.nsys-rep`: the raw nsys capture; open in the Nsight Systems GUI for the full timeline.
+- `<out>/profile.{timing,breakdown}.json`: the intermediate per-stage artifacts.
+
+---
+
+## Hardware / disk notes
+
+- This machine has **8× NVIDIA RTX A6000 (48 GB)**; pin one with the `<gpu>` arg (check `nvidia-smi`
+  for a free device — a real ~3B checkpoint needs the GPU mostly idle; `debug_pi05` fits anywhere).
+- Home is ~20 GB, so the conda env / checkpoints / caches live on **`/scratch`** (see `env.sh`).
+  `openpi/` and `realtime-vla/` are cloned in-tree but git-ignored; `install.sh` pulls them.
+
 ## Extending (modular by file)
 
-- **New system**: add `edge_robotics/systems/<name>.py` implementing `ProfiledSystem` and wire it
-  into the tiny dispatch in `cli._make_system`.
-- **Network simulation**: see `network/` (stub) — wrap openpi's websocket client/server.
-- The profiling primitives (`profiling/{walltime,jax_profiler}.py`) are
-  system-agnostic and reusable.
+- **New system**: add `edge_robotics/systems/<name>.py` implementing `ProfiledSystem` (return a
+  `LoadedSystem` with `infer_segmented` + optional `infer_native`/`component_profiler` and
+  `nvtx_phases`), and wire it into `cli._make_system` + `cli.SYSTEM_PHASES`.
+- The profiling primitives (`profiling/{walltime,nsys}.py`) are system-agnostic and reusable.

@@ -1,4 +1,4 @@
-"""Render the 5-metric table and export JSON/CSV."""
+"""Render the per-run summary and export JSON/CSV. One run == one (system, config, prompt_len)."""
 
 from __future__ import annotations
 
@@ -7,77 +7,135 @@ import json
 import os
 from typing import Any
 
-from .metrics import PhaseRow
 
-
-def _cell(ms: float | None, pct: float | None) -> str:
-    if ms is None:
+def _ms(d: dict | None, key: str = "median") -> str:
+    if not d:
         return "—"
-    if pct is None:
-        return f"{ms:.2f}"
-    return f"{ms:.2f} ({pct:.1f}%)"
+    v = d.get(key)
+    return f"{v:.2f}" if v is not None else "—"
 
 
-def render_table(rows: list[PhaseRow], meta: dict) -> str:
-    head = (
+def _phase_cells(phases_ms: dict | None, phases_pct: dict | None, order: tuple[str, ...]) -> list[str]:
+    out = []
+    for p in order:
+        if not phases_ms or phases_ms.get(p) is None:
+            out.append("—")
+            continue
+        ms = phases_ms[p]
+        pct = (phases_pct or {}).get(p)
+        out.append(f"{ms:.2f} ({pct:.1f}%)" if pct is not None else f"{ms:.2f}")
+    return out
+
+
+def render_summary(meta: dict, result: dict) -> str:
+    order = ("vision", "vlm", "action")
+    lines: list[str] = []
+    lines.append(
         f"Device: {meta.get('device_kind','?')} | system={meta.get('system','?')} | "
-        f"config={meta.get('config_name','?')} | num_steps={meta.get('num_steps','?')} | "
-        f"batch={meta.get('batch_size','?')} | iters={meta.get('iters','?')}"
+        f"config={meta.get('config_name','?')} | prompt_len={meta.get('prompt_len','?')} | "
+        f"num_steps={meta.get('num_steps','?')} | batch={meta.get('batch_size','?')} | "
+        f"iters={meta.get('iters','?')} | compile={meta.get('compile_mode','?')}"
     )
-    cols = ["prompt_len", "Vision ms (%)", "VLM ms (%)", "Action ms (%)", "E2E ms", "Freq Hz"]
-    widths = [10, 18, 18, 18, 10, 9]
-    lines = [head, ""]
-    lines.append("  ".join(c.ljust(w) for c, w in zip(cols, widths)))
-    lines.append("  ".join("-" * w for w in widths))
-    for r in rows:
-        cells = [
-            str(r.prompt_len),
-            _cell(r.vision_ms, r.vision_pct),
-            _cell(r.vlm_ms, r.vlm_pct),
-            _cell(r.action_ms, r.action_pct),
-            f"{r.e2e_ms:.2f}",
-            f"{r.freq_hz:.2f}",
-        ]
-        lines.append("  ".join(c.ljust(w) for c, w in zip(cells, widths)))
-    # per-row method + notes (method/discrepancy can vary by row)
     lines.append("")
-    for r in rows:
-        lines.append(f"  [L={r.prompt_len}] method={r.method}; {r.notes}")
+
+    seg = result.get("e2e_segmented_ms")
+    nat = result.get("e2e_native_ms")
+    seg_mode = meta.get("compile_mode")
+    nat_mode = meta.get("native_compile_mode")
+    seg_tag = f", {seg_mode}" if seg_mode else ""
+    lines.append(f"E2E (segmented, headline{seg_tag}) : {_ms(seg)} ms   (p90 {_ms(seg,'p90')}, min {_ms(seg,'min')})")
+    if nat:
+        ov = result.get("segmentation_overhead_pct")
+        # Only call the gap "segmentation overhead" when both paths used the SAME compile mode;
+        # otherwise it also includes the mode difference, so label it neutrally.
+        same_mode = (seg_mode == nat_mode) or (seg_mode is None and nat_mode is None)
+        nat_tag = f", {nat_mode}" if nat_mode else ""
+        if ov is not None:
+            delta = f"  [segmentation {ov:+.1f}%]" if same_mode else f"  [Δ vs segmented {ov:+.1f}%, modes differ]"
+        else:
+            delta = ""
+        lines.append(f"E2E (native repo-default fast path{nat_tag}): {_ms(nat)} ms{delta}")
+    if result.get("freq_hz") is not None:
+        lines.append(f"Freq                      : {result['freq_hz']:.2f} Hz")
+    lines.append("")
+
+    bd = result.get("breakdown_nvtx")
+    if bd:
+        cells = _phase_cells(bd["phases_ms_per_infer"], bd.get("phases_pct"), order)
+        lines.append("Component breakdown (nsys NVTX GPU projection, graphs ON):")
+        lines.append(f"  vision={cells[0]}  vlm={cells[1]}  action={cells[2]}")
+        # Honest cross-checks: the per-phase GPU projection should sum to ~the E2E wall and ~the
+        # total GPU kernel time. (Σphases can slightly exceed kernel-sum: projection counts the full
+        # per-range GPU-busy span incl. memops/overheads, kernel-sum counts kernels only.)
+        phases_sum = sum(v for v in bd["phases_ms_per_infer"].values() if v)
+        gpu = bd.get("total_gpu_ms_per_infer")
+        xs = [f"Σphases={phases_sum:.2f}ms"]
+        if gpu:
+            xs.append(f"nsys GPU kernels={gpu:.2f}ms")
+        if seg and seg.get("median"):
+            xs.append(f"E2E wall={seg['median']:.2f}ms")
+        lines.append("  cross-check: " + "  |  ".join(xs))
+    elif result.get("breakdown_nvtx_error"):
+        lines.append(f"Component breakdown (NVTX): unavailable ({result['breakdown_nvtx_error']})")
+
+    comp = result.get("components_standalone")
+    if comp:
+        cells = _phase_cells(comp["phases_ms_per_infer"], comp.get("phases_pct"), order)
+        lines.append("Per-component standalone (graphs ON, isolated):")
+        lines.append(f"  vision={cells[0]}  vlm={cells[1]}  action={cells[2]}")
+
+    kb = result.get("kernel_buckets")
+    if kb:
+        b = kb["buckets_ms_per_infer"]
+        pct = kb.get("buckets_pct", {})
+        order_k = ("attention", "gemm", "conv", "elementwise", "other")
+        parts = [f"{k}={b[k]:.2f}({pct.get(k,0):.0f}%)" for k in order_k if k in b]
+        lines.append("Kernel-family buckets (nsys, graphs ON):")
+        lines.append("  " + "  ".join(parts))
+    elif result.get("kernel_buckets_error"):
+        lines.append(f"Kernel buckets: unavailable ({result['kernel_buckets_error']})")
+
     return "\n".join(lines)
 
 
-def write_outputs(output_prefix: str, rows: list[PhaseRow], meta: dict) -> tuple[str, str]:
+def write_outputs(output_prefix: str, meta: dict, result: dict) -> tuple[str, str]:
     os.makedirs(os.path.dirname(os.path.abspath(output_prefix)) or ".", exist_ok=True)
     json_path = f"{output_prefix}.json"
     csv_path = f"{output_prefix}.csv"
 
-    # open(..., "w") truncates, so a rerun with the same --output cleanly overwrites prior results.
     with open(json_path, "w") as f:
-        json.dump({"meta": meta, "rows": [r.to_dict() for r in rows]}, f, indent=2, default=_json_default)
+        json.dump({"meta": meta, "result": result}, f, indent=2, default=_json_default)
 
-    # CSV: one row per (prompt_len, phase) for easy plotting.
+    # Long-format CSV: one row per (metric, phase) for easy plotting across a sweep.
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["prompt_len", "num_steps", "phase", "ms", "pct", "e2e_ms", "freq_hz", "method"])
-        for r in rows:
-            phases = [
-                ("vision", r.vision_ms, r.vision_pct),
-                ("vlm", r.vlm_ms, r.vlm_pct),
-                ("action", r.action_ms, r.action_pct),
-            ]
-            for name, ms, pct in phases:
-                w.writerow(
-                    [
-                        r.prompt_len,
-                        r.num_steps,
-                        name,
-                        "" if ms is None else f"{ms:.4f}",
-                        "" if pct is None else f"{pct:.2f}",
-                        f"{r.e2e_ms:.4f}",
-                        f"{r.freq_hz:.4f}",
-                        r.method,
-                    ]
-                )
+        w.writerow(["system", "config_name", "prompt_len", "num_steps", "metric", "phase", "ms", "pct"])
+        base = [meta.get("system"), meta.get("config_name"), meta.get("prompt_len"), meta.get("num_steps")]
+
+        def emit(metric: str, phases_ms: dict | None, phases_pct: dict | None):
+            if not phases_ms:
+                return
+            for k, v in phases_ms.items():
+                pct = (phases_pct or {}).get(k)
+                w.writerow(base + [metric, k, "" if v is None else f"{v:.4f}",
+                                   "" if pct is None else f"{pct:.2f}"])
+
+        seg = result.get("e2e_segmented_ms")
+        if seg:
+            w.writerow(base + ["e2e", "segmented", f"{seg['median']:.4f}", ""])
+        nat = result.get("e2e_native_ms")
+        if nat:
+            w.writerow(base + ["e2e", "native", f"{nat['median']:.4f}", ""])
+        if result.get("breakdown_nvtx"):
+            emit("breakdown_nvtx", result["breakdown_nvtx"]["phases_ms_per_infer"],
+                 result["breakdown_nvtx"].get("phases_pct"))
+        if result.get("components_standalone"):
+            emit("components_standalone", result["components_standalone"]["phases_ms_per_infer"],
+                 result["components_standalone"].get("phases_pct"))
+        if result.get("kernel_buckets"):
+            emit("kernel_buckets", result["kernel_buckets"]["buckets_ms_per_infer"],
+                 result["kernel_buckets"].get("buckets_pct"))
+
     return json_path, csv_path
 
 

@@ -1,10 +1,10 @@
 """Device-synced steady-state wall timing.
 
-This is NOT a naive `time.time()` measurement: every iteration ends with the system's
-`block` (jax.block_until_ready), which forces the asynchronously-dispatched GPU work to
-actually finish before the clock is read. That is the correct way to time async accelerator
-work and is exactly what a profiler measures for a wall-clock span. Warmup iterations absorb
-JIT compilation so only steady-state is reported.
+This is NOT a naive `time.time()` measurement: every iteration ends with the system's `block`
+(torch.cuda.synchronize), which forces the asynchronously-dispatched GPU work to actually finish
+before the clock is read. That is the correct way to time async accelerator work and is exactly
+what a profiler measures for a wall-clock span. Warmup iterations absorb torch.compile + CUDA-graph
+capture so only steady-state is reported.
 """
 
 from __future__ import annotations
