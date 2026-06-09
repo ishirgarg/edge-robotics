@@ -138,16 +138,48 @@ def build_observation(frame: dict, *, prompt_len: int, action_dim: int, device, 
 
     n_img = len(images)
     img_tokens = n_img * _TOKENS_PER_IMAGE
+    lang_lo, lang_hi = img_tokens, img_tokens + n_real
+
+    # Proprioception: for discrete_state pi05 the tokenizer folds the discretized state digits INTO
+    # the prompt (`Task: {text}, State: {digits};\nAction:`), so the state occupies a token sub-range
+    # in the MIDDLE of the language block — recover it and split it OUT of "language" so the attention
+    # study reports attention to proprioception vs real language separately. For pi05_libero
+    # (discrete_state=False) there is no state token at all -> proprioception absent.
+    proprioception = None
+    language = [(lang_lo, lang_hi)]
+    if discrete_state:
+        s0, s1 = _discrete_state_token_span(tok, frame["prompt"], state8)
+        proprioception = (lang_lo + s0, lang_lo + s1)
+        language = [(lang_lo, lang_lo + s0), (lang_lo + s1, lang_hi)]  # task text + template, sans state
+
     layout = {
         "prefix_len": img_tokens + prompt_len,
         "cameras": {"base": (0, 256), "left_wrist": (256, 512), "right_wrist": (512, 768)},
         "masked_cameras": ["right_wrist"],
-        "language": (img_tokens, img_tokens + n_real),       # real task tokens
-        "language_pad": (img_tokens + n_real, img_tokens + prompt_len),
+        "language": language,                                # list of kv-intervals (excludes state)
+        "language_pad": (lang_hi, img_tokens + prompt_len),
+        "proprioception": proprioception,                    # (lo,hi) kv-range of state digits, or None
         "vision_range": (0, img_tokens),
         "n_real_language_tokens": n_real,
         "tokens_per_image": _TOKENS_PER_IMAGE,
         "prompt": frame["prompt"],
-        "has_proprioception": bool(discrete_state),  # False for pi05_libero — no state token
+        "has_proprioception": proprioception is not None,
     }
     return obs, layout
+
+
+def _discrete_state_token_span(tok, prompt: str, state: np.ndarray) -> tuple[int, int]:
+    """Token sub-range [start, end) of the discretized state digits within the language block.
+
+    Replicates PaligemmaTokenizer.tokenize's discrete-state format (openpi tokenizer.py:23-29) and
+    recovers the span by length-differencing on the SAME SentencePiece processor: `state` begins
+    right after the literal "State: " and ends before ";". The boundaries fall on whitespace, so the
+    prefix token counts are exact (verified)."""
+    cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
+    disc = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+    state_str = " ".join(map(str, disc))
+    sp = tok._tokenizer  # noqa: SLF001 — the SentencePiece processor PaligemmaTokenizer wraps
+    head = f"Task: {cleaned}, State: "
+    start = len(sp.encode(head, add_bos=True))
+    end = len(sp.encode(head + state_str, add_bos=True))
+    return start, end

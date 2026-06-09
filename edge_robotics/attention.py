@@ -10,11 +10,14 @@ attention weights per layer per denoise step by wrapping `eager_attention_forwar
 `_attn_implementation="eager"`, so the suffix attention probabilities are computed explicitly), then
 bucket the attended prefix positions by modality using the layout from libero_obs.
 
-Finding for pi05_libero: discrete_state_input=False => there is NO proprioceptive token (state is
-neither in the prompt nor a suffix token), so attention splits over VISION vs LANGUAGE only; the
-"proprioception" modality is reported as absent. (Known limitation: a discrete-state pi05 config
-folds a discretized state span INTO the prompt as ordinary language tokens — those would currently be
-counted within the "language" bucket, not separated, since the state is interleaved mid-prompt.)
+Proprioception handling (it enters the model differently per config):
+  * pi05_libero (discrete_state_input=False): NO proprioceptive token — state is neither in the
+    prompt nor a suffix token — so attention splits over VISION vs LANGUAGE only (proprioception=0).
+  * discrete-state pi05 (pi05_droid/aloha/base): the tokenizer folds a discretized state span INTO
+    the prompt; libero_obs recovers that token sub-range (_discrete_state_token_span) so attention to
+    PROPRIOCEPTION is bucketed separately from real LANGUAGE (which becomes two intervals around it).
+  * pi0: state is a continuous SUFFIX token (separable at suffix index 0) — handled when a pi0
+    observation builder sets layout["proprioception"]; the pi0 suffix is action_horizon+1 tokens.
 """
 
 from __future__ import annotations
@@ -92,17 +95,23 @@ def capture_action_attention(model, obs, *, num_steps: int, action_horizon: int,
     return attn
 
 
-# Modalities, in display order. Each maps to a (start, end) kv-column range via the layout.
+# Modalities, in display order. Each maps to a kv-column range (a (start,end) tuple OR a list of
+# such tuples) via the layout. "language" excludes the discrete-state span; "proprioception" (when
+# present) is that span — for discrete_state pi05 it sits INSIDE the prompt, so language is two
+# intervals around it (see libero_obs.build_observation).
 def _modality_ranges(layout: dict, prefix_len: int, action_horizon: int) -> dict:
     cams = layout["cameras"]
-    return {
+    ranges = {
         "vision_base": cams["base"],
         "vision_left_wrist": cams["left_wrist"],
         "vision_right_wrist(masked)": cams["right_wrist"],
-        "language": tuple(layout["language"]),
+        "language": layout["language"],                      # tuple OR list of intervals (sans state)
         "language_pad(masked)": tuple(layout["language_pad"]),
         "action_self": (prefix_len, prefix_len + action_horizon),
     }
+    if layout.get("proprioception"):
+        ranges["proprioception"] = tuple(layout["proprioception"])
+    return ranges
 
 
 def bucket_attention(attn: np.ndarray, layout: dict, *, action_horizon: int) -> dict:
@@ -115,21 +124,26 @@ def bucket_attention(attn: np.ndarray, layout: dict, *, action_horizon: int) -> 
     prefix_len = layout["prefix_len"]
     ranges = _modality_ranges(layout, prefix_len, action_horizon)
 
-    def mass(a, rng):  # sum prob mass over a kv range, on a [...,kv] array
-        lo, hi = rng
-        return a[..., lo:hi].sum(axis=-1)
+    def mass(a, rng):  # sum prob mass over a kv range (tuple) or list of ranges, on a [...,kv] array
+        intervals = rng if isinstance(rng, list) else [rng]
+        out = None
+        for lo, hi in intervals:
+            m = a[..., lo:hi].sum(axis=-1)
+            out = m if out is None else out + m
+        return out
 
     overall, per_layer, per_step = {}, {}, {}
     for name, rng in ranges.items():
         overall[name] = float(mass(attn, rng).mean())
         per_layer[name] = mass(attn, rng).mean(axis=(0, 2, 3)).tolist()        # over steps,heads,q
         per_step[name] = mass(attn, rng).mean(axis=(1, 2, 3)).tolist()         # over layers,heads,q
-    # Modality groups: vision (all cams) vs language vs the suffix self-attention.
+    # Modality groups: vision (all cams) vs language vs proprioception vs the suffix self-attention.
     grouped = {
         "vision": sum(overall[k] for k in overall if k.startswith("vision")),
         "language": overall["language"] + overall["language_pad(masked)"],
         "action_self": overall["action_self"],
-        "proprioception": 0.0 if not layout.get("has_proprioception") else None,
+        # 0.0 when there is no state token (pi05_libero); the real fraction when state is in-prompt.
+        "proprioception": overall.get("proprioception", 0.0),
     }
     return {
         "overall_fraction": overall,
@@ -187,6 +201,8 @@ def make_plots(attn: np.ndarray, buckets: dict, layout: dict, frame: dict, outdi
     steps = range(len(vis))
     ax.plot(steps, vis, "-o", label="vision"); ax.plot(steps, lang, "-o", label="language")
     ax.plot(steps, ps["action_self"], "-o", label="action self")
+    if "proprioception" in ps:
+        ax.plot(steps, ps["proprioception"], "-o", label="proprioception")
     ax.set_xlabel("denoise step"); ax.set_ylabel("attention fraction"); ax.legend()
     ax.set_title("Attention vs denoise step"); fig.tight_layout()
     p = os.path.join(outdir, "attn_vs_denoise_step.png"); fig.savefig(p, dpi=130); plt.close(fig); paths.append(p)
