@@ -327,8 +327,23 @@ class OpenpiTorchSystem(ProfiledSystem):
                 "error": None if total > 0 else "no component timings",
             }
 
+        # Measured server->edge transfer cross-check: the REAL prefix KV cache the action expert
+        # conditions on (gemma_2b prefill output). One eager vision+vlm pass on the synthetic obs
+        # (value-independent), summed K+V tensor bytes. Non-fatal — bandwidth.py also computes it
+        # analytically from dims.
+        kv_cache_bytes_measured = None
+        try:
+            with torch.inference_mode():
+                _pe, _ppm, _pam, _st0 = _vision(obs)
+                _kc, _vc = _vlm(_pe, _ppm, _pam)
+            kv_cache_bytes_measured = int(sum(t.numel() * t.element_size() for t in _kc)
+                                          + sum(t.numel() * t.element_size() for t in _vc))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[openpi_torch] KV-cache measurement skipped ({type(exc).__name__}: {exc})")
+
         meta = {
             "backend": "openpi-torch",
+            "kv_cache_bytes_measured": kv_cache_bytes_measured,
             "attribution": "headline = native single-compile (max-autotune) E2E; component split = "
             "nsys NVTX GPU projection over per-phase CUDA graphs (graphs ON, same compile mode)",
             "checkpoint": "random-init" if real_ckpt is None else real_ckpt,

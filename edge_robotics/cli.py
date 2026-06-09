@@ -214,7 +214,7 @@ def _top_meta(config: Config, loaded) -> dict:
             for k in (
                 "action_horizon", "action_dim", "paligemma_variant", "action_expert_variant",
                 "dtype", "compute_dtype", "n_images", "prefix_len_nominal", "max_token_len", "pi05",
-                "discrete_state_input", "proprioception",
+                "discrete_state_input", "proprioception", "kv_cache_bytes_measured",
             )
         },
         "environment": _environment_meta(config),
@@ -374,6 +374,15 @@ def _run_report(config: Config) -> None:
         print(f"[report] WARNING: roofline computation failed ({exc}); omitting.")
         roofline = None
 
+    # Server<->edge transfer sizing: per-inference bytes the action expert conditions on (prefix KV
+    # cache + masks + state) if the VLM ran on a server. Rate uses the deployed (headline) freq.
+    from . import bandwidth as _bandwidth
+    try:
+        bandwidth = _bandwidth.analyze(meta, freq_hz=(1000.0 / e2e_wall if e2e_wall else None))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[report] WARNING: bandwidth sizing failed ({exc}); omitting.")
+        bandwidth = None
+
     result = build_result(
         e2e_segmented=timing.get("e2e_segmented_ms"),
         e2e_native=native.get("e2e_native_ms"),
@@ -382,6 +391,7 @@ def _run_report(config: Config) -> None:
         components_standalone=timing.get("components_standalone"),
         kernel_analysis=breakdown.get("kernel_analysis"),
         roofline=roofline,
+        bandwidth=bandwidth,
     )
     print("\n" + render_summary(meta, result))
     json_path, csv_path = write_outputs(config.output, meta, result)

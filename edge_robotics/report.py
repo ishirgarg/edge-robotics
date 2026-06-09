@@ -106,8 +106,30 @@ def render_summary(meta: dict, result: dict) -> str:
 
     _render_kernel_analysis(result.get("kernel_analysis"), order, lines)
     _render_roofline(result.get("roofline"), order, lines)
+    _render_bandwidth(result.get("bandwidth"), lines)
 
     return "\n".join(lines)
+
+
+def _render_bandwidth(bw: dict | None, lines: list[str]) -> None:
+    """Server->edge transfer: per-inference bytes the action expert conditions on (KV cache + state)."""
+    if not bw:
+        return
+    det = bw.get("kv_cache_detail", {})
+    lines.append("")
+    lines.append("Server->edge transfer (VLM on server, action expert on edge):")
+    kv = f"  prefix KV cache: {bw['kv_cache_mib']:.2f} MiB"
+    if bw.get("kv_cache_measured_mib") is not None:
+        kv += f"  (measured {bw['kv_cache_measured_mib']:.2f} MiB)"
+    kv += (f"  [{det.get('layers')}L x K,V x {det.get('prefix_len')}tok x "
+           f"kv_heads={det.get('kv_heads')} x d{det.get('head_dim')}, {det.get('dtype')}]")
+    lines.append(kv)
+    lines.append(f"  + pad mask {bw['prefix_pad_mask_bytes'] / 1024:.1f} KiB + state {bw['state_bytes']} B"
+                 f"  =>  total {bw['total_conditioning_mib']:.2f} MiB / inference")
+    if bw.get("required_bandwidth_mbytes_per_s") is not None:
+        lines.append(f"  at {bw['freq_hz']:.1f} Hz  =>  {bw['required_bandwidth_mbytes_per_s']:.1f} MB/s "
+                     f"({bw['required_bandwidth_mbit_per_s']:.0f} Mbit/s)")
+    lines.append(f"  (alt split — vision on server: ship {bw['alt_vision_split_mib']:.2f} MiB image embeds)")
 
 
 def _render_kernel_analysis(ka: dict | None, order: tuple[str, ...], lines: list[str]) -> None:
@@ -260,6 +282,17 @@ def write_outputs(output_prefix: str, meta: dict, result: dict) -> tuple[str, st
                     if m.get(key) is not None:
                         w.writerow(base + [metric, p, f"{100*m[key]:.4f}", ""])
                 w.writerow(base + ["roofline_oi", p, f"{r['arithmetic_intensity']:.4f}", r["bound"]])
+
+        # Server<->edge transfer sizing (bytes; rate in MB/s).
+        bw = result.get("bandwidth")
+        if bw:
+            for k in ("kv_cache_bytes", "kv_cache_bytes_measured", "total_conditioning_bytes",
+                      "alt_vision_split_bytes"):
+                if bw.get(k) is not None:
+                    w.writerow(base + ["bandwidth", k, str(bw[k]), ""])
+            if bw.get("required_bandwidth_mbytes_per_s") is not None:
+                w.writerow(base + ["bandwidth", "required_mbytes_per_s",
+                                   f"{bw['required_bandwidth_mbytes_per_s']:.4f}", ""])
 
     return json_path, csv_path
 

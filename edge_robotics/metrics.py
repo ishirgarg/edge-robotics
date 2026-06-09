@@ -54,6 +54,7 @@ def build_result(
     components_standalone: dict | None,
     kernel_analysis: dict | None = None,
     roofline: dict | None = None,
+    bandwidth: dict | None = None,
 ) -> dict:
     """Combine whatever measurements are present into one JSON-serializable result dict."""
     res: dict = {}
@@ -123,5 +124,9 @@ def build_result(
     # Analytic roofline lower bound + measured efficiency (MFU/MBU, ideal-vs-achieved).
     if roofline is not None:
         res["roofline"] = roofline
+
+    # Server<->edge transfer sizing (KV cache + conditioning data per inference).
+    if bandwidth is not None:
+        res["bandwidth"] = bandwidth
 
     return res
