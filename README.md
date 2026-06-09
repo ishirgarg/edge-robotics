@@ -7,9 +7,11 @@ re-running the model eager to peek inside it.
 
 For each run it reports:
 
-- **E2E (ms / Freq)** — wall latency of the full inference (graphs on).
-- **Component breakdown** — Vision / VLM / Action GPU time from a single nsys capture.
-- **Per-component standalone** — each component timed on its own, also fully optimized (graphs on).
+- **E2E (ms / Freq)** — headline wall latency of the full inference, measured on the **DEPLOYED**
+  native single-compile (max-autotune) path (graphs on) — the latency the robot actually sees.
+- **Component breakdown** — Vision / VLM / Action GPU time from a single nsys capture of the
+  segmented (per-phase-graph) run (the within-run breakdown vehicle).
+- **Per-component standalone** — each component timed on its own (secondary cross-check; graphs on).
 - **Per-phase × kernel-family** — attention vs GEMM (weights/activations) vs elementwise vs memory
   ops, *crossed with* the Vision/VLM/Action phases, plus a compute-GEMM vs memory-bound-GEMV split.
   Answers "attention vs W/A, backbone vs action part."
@@ -18,17 +20,24 @@ For each run it reports:
 - **Roofline** — analytic ideal lower bound (`max(FLOPs/peak, Bytes/BW)` per operator, after
   [NVlabs/vla-perf](https://github.com/NVlabs/vla-perf)) with arithmetic intensity, compute-vs-memory
   bound, and **how far from ideal** we are (MFU/MBU, efficiency). Answers "compare with roofline."
-- **LIBERO attention study** *(separate tool)* — with the REAL pi05_libero weights, how the action
-  expert attends to vision vs language vs proprioception. See `scripts/attention_heatmaps.py`.
+- **Server↔edge transfer** — per-inference bytes the action expert conditions on (the VLM's prefix
+  KV cache + masks + state) if the VLM ran on a server and the action expert on the edge. Answers
+  "how much network bandwidth for a VLM-on-server / VLA-on-edge split." (`edge_robotics/bandwidth.py`)
+- **Attention study** *(separate tool)* — with REAL weights, how the action expert attends to vision
+  vs language vs proprioception. For discrete-state pi05 (state folded into the prompt) proprioception
+  is separated from language. See `scripts/attention_heatmaps.py`.
 
-Two backends (pick with `--system`):
+The framework is config-driven: `--config-name` is resolved via openpi `get_config`, so any
+**pi0/pi05 × DROID/ALOHA/LIBERO** config works on the openpi-torch backend with no new code, and the
+roofline is **quantization-aware** (a `QuantScheme` for int8/fp8/int4 variants). Two backends
+(pick with `--system`):
 
 | `--system` | what | component attribution |
 |------------|------|-----------------------|
-| `pi05_openpi_torch` | openpi's native **PyTorch** port (`PI0Pytorch`) | **nsys NVTX GPU projection** over per-phase CUDA graphs — clean Vision/VLM/Action split, graphs ON |
-| `pi05_realtimevla` | PyTorch + Triton, from [dexmal/realtime-vla](https://github.com/dexmal/realtime-vla) (fused Triton kernels + CUDA-graph replay) | **same NVTX split** — we re-capture its single graph as three per-stage sub-graphs (bitwise-identical to native), plus kernel-family buckets |
+| `openpi_torch` | openpi's native **PyTorch** port (`PI0Pytorch`); serves any pi0/pi05 × dataset config | **nsys NVTX GPU projection** over per-phase CUDA graphs — clean Vision/VLM/Action split, graphs ON |
+| `realtime_vla` | PyTorch + Triton, from [dexmal/realtime-vla](https://github.com/dexmal/realtime-vla) (fused Triton kernels + CUDA-graph replay); **pi05 only** | **same NVTX split** — we re-capture its single graph as three per-stage sub-graphs (bitwise-identical to native), plus kernel-family buckets |
 
-> The JAX backend was removed. This repo now profiles the two PyTorch paths.
+> The `pi05_openpi_torch` / `pi05_realtimevla` names are accepted as aliases. The JAX backend was removed.
 
 ---
 
@@ -50,7 +59,7 @@ call (never inside a compiled region). nsys `nvtx_gpu_proj_sum` then attributes 
 phase. Cross-phase tensors (prefix embeds, the KV cache, masks, state) are `.clone()`d out of each
 graph's static pool, and `cudagraph_mark_step_begin()` is called before each graph invocation, as
 CUDA-graph trees require. This is what `infer_segmented` in
-`edge_robotics/systems/pi05_openpi_torch.py` does.
+`edge_robotics/systems/openpi_torch.py` does.
 
 Validated on the real model (pi05_libero, A6000, graphs on): the per-phase NVTX projection sums to
 **~99%** of E2E, and the segmented path's wall time is **within noise of** openpi's native
@@ -58,15 +67,17 @@ single-compile path — so segmenting buys an attributable breakdown at no measu
 
 ### The numbers
 
-- **E2E (segmented, headline)** — median device-synced **wall** time of the per-phase-graph
-  inference. **Freq = 1000/E2E.** Warmup absorbs `torch.compile` + cudagraph capture.
-- **E2E (native, cross-check)** — the **faithful, fully-optimized repo baseline**, exactly as each
-  repo ships it: openpi → `torch.compile(sample_actions, mode="max-autotune")` (openpi's own
-  `Pi0Config` default); realtime-vla → its single captured CUDA graph (`infer.forward`, the
-  `benchmark.py` path). The gap vs segmented is the segmentation overhead (≈0 when both use the same
-  mode). The segmented breakdown defaults to `reduce-overhead` for fast compiles
-  (`OPENPI_TORCH_COMPILE_MODE`); the native baseline keeps `max-autotune`
-  (`OPENPI_TORCH_NATIVE_COMPILE_MODE`) so it stays faithful to the original.
+- **E2E (native, HEADLINE)** — median device-synced **wall** time of the **deployed** path, exactly
+  as each repo ships it: openpi → `torch.compile(sample_actions, mode="max-autotune")` (openpi's own
+  `Pi0Config` default); realtime-vla → its single captured CUDA graph (`infer.forward`). **Freq =
+  1000/E2E.** Warmup absorbs `torch.compile` + cudagraph capture. This is the headline because it
+  carries no segmentation artifacts. (If `CROSS_CHECK_NATIVE=0` skips it, the headline falls back to
+  the segmented wall, flagged `headline_source=segmented`.)
+- **E2E (segmented, breakdown vehicle)** — wall time of the per-phase-graph inference; its purpose is
+  the within-run NVTX split, not the headline (it carries `.clone()`/eager-glue overhead). Both paths
+  default to `max-autotune` (`OPENPI_TORCH_COMPILE_MODE` / `OPENPI_TORCH_NATIVE_COMPILE_MODE`) so the
+  per-phase kernels are the deployed kernels and the seg-vs-native gap is a clean segmentation cost.
+  Set `OPENPI_TORCH_COMPILE_MODE=reduce-overhead` only for fast iteration (degrades breakdown fidelity).
 - **Component breakdown** — GPU ms/infer per phase from nsys `nvtx_gpu_proj_sum`. `%` is each
   phase's share. `attributed_frac` (share of GPU time landing in a phase) and `residual` (inter-phase
   glue: noise sampling, the `x_t+dt·v_t` update, D2D copies) are reported, not hidden.
@@ -81,11 +92,11 @@ single-compile path — so segmenting buys an attributable breakdown at no measu
 Because nsys must wrap the whole process (and CUPTI perturbs wall timing), one profiling run is split
 into cheap stages the shell sequences (`--mode`):
 
-1. **time** — pristine wall: segmented E2E (headline) + per-component standalone → `<out>.timing.json`
-2. **time-native** — openpi's native single-compile E2E, in its OWN process (cross-check) →
+1. **time** — pristine wall: segmented E2E (breakdown vehicle) + per-component standalone → `<out>.timing.json`
+2. **time-native** — the DEPLOYED native single-compile E2E = the **HEADLINE**, in its OWN process →
    `<out>.timing-native.json`. Separate because the native fused graph and the per-phase graphs
-   thrash the shared cudagraph pool if run together (dynamo recompiles every call). Skip with
-   `CROSS_CHECK_NATIVE=0`.
+   thrash the shared cudagraph pool if run together (dynamo recompiles every call). `CROSS_CHECK_NATIVE=0`
+   skips it, but then the headline falls back to the (non-deployment-faithful) segmented wall.
 3. **nsys** — bracket one steady-state segmented run UNDER `nsys profile` → `<out>.nsys-rep`
 4. **parse** — NVTX split + kernel buckets from the report → `<out>.breakdown.json`
 5. **report** — merge → `<out>.json` / `<out>.csv` (+ printed summary)
@@ -131,8 +142,19 @@ and is where the headroom is: openpi-torch hits 41% of its memory roofline, whil
 fused Triton kernels hit ~93%** of the same roofline (15.5 ms vs 35.3 ms) — the clearest concrete
 optimization signal in the study. End-to-end, the measured wall is ~50% of the analytic ideal.
 
-> Roofline hardware is auto-detected (A6000); override for other targets with
-> `EDGE_ROBOTICS_PEAK_BF16_TFLOPS` / `EDGE_ROBOTICS_MEM_BW_GBPS` (e.g. to model a Jetson at the edge).
+> Roofline hardware is auto-detected (A6000; unknown GPUs warn before defaulting); override for other
+> targets with `EDGE_ROBOTICS_PEAK_BF16_TFLOPS` / `EDGE_ROBOTICS_MEM_BW_GBPS` (e.g. to model a Jetson).
+> The roofline is **quantization-aware**: a `QuantScheme` (weights/activations/kv/compute dtype, read
+> from the run's meta) rescales the bytes and selects the int8/fp8/int4 tensor-core peak; bf16 (the
+> default) is byte-identical to the dense model.
+
+**4. Server↔edge transfer (`edge_robotics/bandwidth.py`).** If the heavy VLM ran on a server and only
+the action expert on the edge robot, the per-inference data crossing the network is what the expert
+**conditions on** — dominated by the VLM's prefix **KV cache** (gemma_2b prefill: depth × {K,V} ×
+prefix_len × kv_heads(MQA=1) × head_dim) plus the pad mask and (pi0) state. For pi05_libero that's
+**~17 MiB/inference** (≈200 MB/s at the deployed rate; the openpi-torch backend cross-checks it by
+measuring the real KV tensors — analytic == measured). The alternative vision-on-server split ships
+only the ~3 MiB image embeddings instead — a concrete bandwidth trade-off for disaggregated VLA.
 
 ---
 
@@ -160,22 +182,25 @@ required by `PI0Pytorch`), and sanity-checks imports.
 ```bash
 source env.sh   # activate env + point caches at /scratch + JAX_PLATFORMS=cpu
 
-# one system, one config, one prompt length (all four stages, end to end):
-./profile_one.sh pi05_openpi_torch pi05_libero 200 6 out/libero_torch_L200
-#                <system>          <config>     <L> <gpu> <out_dir>
+# one system, one config (prompt_len 'native' = the config's trained value; all stages, end to end):
+./profile_one.sh openpi_torch pi05_libero native 6 out/libero_torch
+#                <system>      <config>     <L>    <gpu> <out_dir>     # <L> can be an int to sweep
 ```
 
 Env overrides for `profile_one.sh`: `CHECKPOINT` (default `random`), `NUM_STEPS` (10), `WARMUP` (3),
-`ITERS` (20), `BATCH_SIZE` (1), `OPENPI_TORCH_COMPILE_MODE`.
+`ITERS` (20), `BATCH_SIZE` (1), `CROSS_CHECK_NATIVE` (1), `OPENPI_TORCH_COMPILE_MODE`.
 
-`OPENPI_TORCH_COMPILE_MODE`: `reduce-overhead` (default — CUDA graphs, compiles fast),
-`max-autotune` (openpi's default — also graphs, compiles for many minutes), or `none`/`eager`
-(graphs off; the NVTX split won't be available).
+`OPENPI_TORCH_COMPILE_MODE`: `max-autotune` (default — openpi's deployed mode, CUDA graphs; compiles
+for a few minutes), `reduce-overhead` (CUDA graphs, fast compile — fast iteration only), or
+`none`/`eager` (graphs off; the NVTX split won't be available).
 
-### Sweep over backends × prompt lengths
+### Sweep over backends × configs × prompt lengths
 
 ```bash
-./profile_sweep.sh        # edit SYSTEMS / CONFIG_NAME / PROMPT_LENS / GPU at the top
+# the matrix (env-overridable, space-separated lists); pi0_* auto-skipped on the pi05-only realtime_vla:
+CONFIGS="pi05_libero pi05_droid pi0_droid pi0_aloha" SYSTEMS="openpi_torch realtime_vla" \
+  PROMPT_LENS="native" GPU=0 ./profile_sweep.sh
+# per-config real checkpoints (else random-init): CKPT_pi05_libero=/scratch/.../pi05_libero_torch ...
 ```
 
 `profile_sweep.sh` just loops `profile_one.sh` (the one-config unit of work) sequentially on one GPU.
@@ -186,13 +211,13 @@ processes all padded positions, so larger prompts grow the VLM prefill (~quadrat
 ### Run a single stage directly
 
 ```bash
-python scripts/profile_policy.py --system pi05_openpi_torch --config-name pi05_libero \
-  --checkpoint random --gpu 6 --prompt-len 200 --mode time --output out/x/profile
+python scripts/profile_policy.py --system openpi_torch --config-name pi05_libero \
+  --checkpoint random --gpu 6 --mode time --output out/x/profile   # omit --prompt-len for native
 ```
 
 ### realtime-vla backend
 
-Same `profile_one.sh`, `--system pi05_realtimevla`. The smoke path needs **no checkpoint and no
+Same `profile_one.sh`, `--system realtime_vla`. The smoke path needs **no checkpoint and no
 tokenizer** (random weights + random language embeds, like realtime-vla's `benchmark.py`). Caveats
 (see also `out/*.json` `meta`):
 
@@ -223,7 +248,8 @@ Then profile the real weights (identical latency, now a faithful artifact), or r
 
 ```bash
 # real-weights profiling run (the full deep stack, on the real deployed model):
-./profile_one.sh pi05_openpi_torch pi05_libero 200 6 out/real_libero_L200   # CHECKPOINT=<the converted dir>
+CHECKPOINT=/scratch/ishirgarg/openpi_cache/pi05_libero_torch \
+  ./profile_one.sh openpi_torch pi05_libero native 6 out/real_libero
 
 # attention heatmaps: how the action expert attends to vision vs language vs proprioception,
 # with the REAL weights on a REAL LIBERO frame (eager — an interpretability artifact, not a timing):
@@ -235,9 +261,12 @@ python scripts/attention_heatmaps.py \
 left plate…"): the action expert attends **~45% to language, ~32% to vision, ~23% to its own action
 tokens** — the task instruction drives action most. Within vision, the **wrist camera (~25%) far
 outweighs the base camera (~7%)**. The absent 3rd camera (masked) and padded language tokens get
-**0.0** (a built-in correctness check; per-query softmax mass sums to 1.0). **There is no
-proprioception modality**: pi05_libero sets `discrete_state_input=False`, so robot state is neither a
-prompt token nor a suffix token — the policy conditions on vision + language only. Outputs:
+**0.0** (a built-in correctness check; per-query softmax mass sums to 1.0). For **pi05_libero there is
+no proprioception modality** (`discrete_state_input=False` → state is neither a prompt nor a suffix
+token; the policy conditions on vision + language only). For **discrete-state pi05** (pi05_droid /
+aloha / base) the state IS folded into the prompt, so the study recovers that token span and reports a
+separate **proprioception** bucket distinct from language (pi0 instead carries state as a continuous
+suffix token). Outputs:
 `attention.json` + four plots (by-modality bar, layer×modality heatmap, attention-vs-denoise-step,
 and a spatial overlay of action→base-camera attention on the real image).
 
@@ -269,8 +298,9 @@ and a spatial overlay of action→base-camera attention on the real image).
 ## Extending (modular by file)
 
 - **New system**: add `edge_robotics/systems/<name>.py` implementing `ProfiledSystem` (return a
-  `LoadedSystem` with `infer_segmented` + optional `infer_native`/`component_profiler` and
-  `nvtx_phases`), and wire it into `cli._make_system` + `cli.SYSTEM_PHASES`.
+  `LoadedSystem` with `infer_native` [the headline] + `infer_segmented` + optional `component_profiler`,
+  and `nvtx_phases`), and wire it into `cli._make_system`. Phases flow from `LoadedSystem.nvtx_phases`
+  (persisted into meta and read back by the offline `parse`/`report` stages) — there is no phase table to edit.
 - The profiling primitives (`profiling/{walltime,nsys}.py`) are system-agnostic and reusable.
 - **Deep analysis** is system-agnostic too: `profiling/kernel_analysis.py` (per-phase×family + system
   overhead from the nsys SQLite) and `roofline.py` (analytic lower bound from model dims + hardware
