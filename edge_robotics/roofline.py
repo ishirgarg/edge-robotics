@@ -359,7 +359,7 @@ def compute_roofline(shape: ModelShape, hw: HardwareSpec, scheme: QuantScheme | 
     e2e_bytes = vision["bytes"] + vlm["bytes"] + action["bytes"]
     return {
         "hardware": {"name": hw.name, "bf16_tflops": hw.bf16_tflops, "mem_bw_gbps": hw.mem_bw_gbps,
-                     "ridge_point_oi": hw.ridge_oi},
+                     "ridge_point_oi": hw.ridge_for(cd)},  # ridge at the run's compute dtype (bf16 default)
         "shape": vars(shape),
         "phases": {"vision": vision, "vlm": vlm, "action": action},
         "e2e": {
@@ -405,9 +405,10 @@ def merge_with_measured(roofline: dict, *, phases_gpu_ms: dict | None, e2e_wall_
     if e2e_wall_ms:
         e2e["measured_wall_ms"] = e2e_wall_ms
         e2e["roofline_vs_wall"] = ideal / e2e_wall_ms
-        if gpu_sum:
-            e2e["system_overhead_ms"] = e2e_wall_ms - gpu_sum
-            e2e["system_overhead_pct"] = 100.0 * (e2e_wall_ms - gpu_sum) / e2e_wall_ms
+        # NOTE: no wall-minus-GPU "system overhead" here — `e2e_wall_ms` is the native (headline) wall
+        # while `gpu_sum` is the SEGMENTED per-phase GPU time (different execution paths/processes), so
+        # their difference is meaningless (can go negative). kernel_analysis reports a path-consistent
+        # non-GPU overhead (segmented pristine wall - segmented GPU-busy) instead.
     out["e2e"] = e2e
     return out
 

@@ -148,7 +148,7 @@ def build_observation(frame: dict, *, prompt_len: int, action_dim: int, device, 
     proprioception = None
     language = [(lang_lo, lang_hi)]
     if discrete_state:
-        s0, s1 = _discrete_state_token_span(tok, frame["prompt"], state8)
+        s0, s1 = _discrete_state_token_span(tok, frame["prompt"], state8, n_real)
         proprioception = (lang_lo + s0, lang_lo + s1)
         language = [(lang_lo, lang_lo + s0), (lang_lo + s1, lang_hi)]  # task text + template, sans state
 
@@ -168,18 +168,25 @@ def build_observation(frame: dict, *, prompt_len: int, action_dim: int, device, 
     return obs, layout
 
 
-def _discrete_state_token_span(tok, prompt: str, state: np.ndarray) -> tuple[int, int]:
+def _discrete_state_token_span(tok, prompt: str, state: np.ndarray, n_real: int) -> tuple[int, int]:
     """Token sub-range [start, end) of the discretized state digits within the language block.
 
-    Replicates PaligemmaTokenizer.tokenize's discrete-state format (openpi tokenizer.py:23-29) and
-    recovers the span by length-differencing on the SAME SentencePiece processor: `state` begins
-    right after the literal "State: " and ends before ";". The boundaries fall on whitespace, so the
-    prefix token counts are exact (verified)."""
+    Replicates PaligemmaTokenizer.tokenize's discrete-state format (openpi tokenizer.py:23-29), then
+    recovers the span by BYTE OFFSETS, not length-differencing. Length-differencing is off-by-one
+    when the first state digit is "-1" (state[0] < -1): SentencePiece merges the trailing space of
+    "State: " with the "-" into one `▁-` piece, so the standalone space piece that `encode(head)`
+    counts vanishes in the full encoding. Byte-overlap instead assigns the merged piece to the state
+    (its byte span crosses the state boundary), which is correct. Clamped to n_real for truncation."""
     cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
     disc = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
     state_str = " ".join(map(str, disc))
-    sp = tok._tokenizer  # noqa: SLF001 — the SentencePiece processor PaligemmaTokenizer wraps
+    full = f"Task: {cleaned}, State: {state_str};\nAction: "
     head = f"Task: {cleaned}, State: "
-    start = len(sp.encode(head, add_bos=True))
-    end = len(sp.encode(head + state_str, add_bos=True))
-    return start, end
+    b0 = len(head.encode("utf-8"))                      # byte where the state digits begin
+    b1 = b0 + len(state_str.encode("utf-8"))            # byte where they end (before ";")
+    sp = tok._tokenizer  # noqa: SLF001 — the SentencePiece processor PaligemmaTokenizer wraps
+    pieces = sp.EncodeAsImmutableProto(full).pieces     # each piece carries byte .begin/.end (no BOS)
+    start = next((i for i, p in enumerate(pieces) if p.end > b0), len(pieces))
+    end = next((i for i, p in enumerate(pieces) if p.begin >= b1), len(pieces))
+    start, end = start + 1, end + 1                     # tokens are encoded with add_bos=True (+1)
+    return min(start, n_real), min(end, n_real)         # clamp into the real (non-pad) token range

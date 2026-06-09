@@ -53,6 +53,10 @@ from .base import LoadedSystem, ProfiledSystem
 # with zero per-config code here and can never drift from openpi's numbers. _LOCAL_CONFIGS is ONLY
 # for synthetic configs openpi doesn't ship (fast pipeline smoke tests).
 _LOCAL_CONFIGS: dict[str, dict] = {
+    # Generic base models — NOT openpi TrainConfigs (those are dataset-specific), but valid pi0/pi05
+    # architectures (action_horizon=50) worth profiling; mirror realtime_vla's RT_REGISTRY.
+    "pi0_base": dict(),               # pi05=False, action_horizon=50, max_token_len=48
+    "pi05_base": dict(pi05=True),     # pi05=True,  action_horizon=50, max_token_len=200
     # tiny model for fast pipeline smoke tests (no checkpoint needed; use --checkpoint random)
     "debug_pi05": dict(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
 }

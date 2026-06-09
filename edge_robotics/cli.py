@@ -5,8 +5,9 @@ One invocation profiles ONE (system, config, prompt_len). Sweeps are the shell's
 Nsight Systems. Because nsys must wrap the whole process and CUPTI perturbs wall timing, the work
 is split across four cheap modes the shell drives in sequence:
 
-  time   : load model, time segmented E2E (headline) + native E2E (cross-check) + per-component
-           standalone -> <out>.timing.json. NOT under nsys, so the wall numbers are pristine.
+  time   : load model, time segmented E2E (the breakdown vehicle) + per-component standalone
+           -> <out>.timing.json. NOT under nsys, so the wall numbers are pristine. (The deployed
+           native E2E = the HEADLINE latency is timed separately by `time-native`.)
   nsys   : load model, warmup, bracket ONE steady-state segmented inference with cudaProfilerStart/
            Stop + NVTX. Run by the shell UNDER `nsys profile`; nsys writes <out>.nsys-rep.
   parse  : no model load. Parse <out>.nsys-rep -> NVTX per-phase split + kernel-family buckets ->
@@ -232,7 +233,7 @@ def run(config: Config) -> None:
 
 
 def _run_time(config: Config) -> None:
-    """Pristine wall timing (no nsys): segmented E2E (headline) + per-component standalone.
+    """Pristine wall timing (no nsys): segmented E2E (breakdown vehicle) + per-component standalone.
 
     Deliberately does NOT exercise the native path — that shares the cudagraph pool with the
     per-phase graphs and would thrash. The native cross-check is its own process (`time-native`).
@@ -308,7 +309,10 @@ def _run_parse(config: Config) -> None:
     # load the model. Phases are the loaded system's own nvtx_phases (authoritative), not a table.
     timing = _read_json(f"{config.output}.timing.json") or {}
     tmeta = timing.get("meta") or {}
-    phases = tuple(tmeta.get("nvtx_phases") or _DEFAULT_PHASES)
+    # Distinguish an intentionally-empty phase list ([] = opaque graph, buckets-only) from a missing
+    # key (fall back to the default split). `or` would wrongly turn [] into the default.
+    _ph = tmeta.get("nvtx_phases")
+    phases = tuple(_ph) if _ph is not None else _DEFAULT_PHASES
     breakdown = parse_nvtx_gpu_proj(rep, iters=config.iters, phases=phases) if phases else None
     buckets = parse_kernel_buckets(rep, iters=config.iters)
 
@@ -334,6 +338,10 @@ def _run_parse(config: Config) -> None:
         print(f"[parse] kernel buckets: { {k: round(v,2) for k,v in buckets['buckets_ms_per_infer'].items()} }")
     if kernel_analysis and kernel_analysis.get("ok"):
         s = kernel_analysis["system"]
+        frac = s.get("phase_attributed_frac")
+        if frac is not None and frac < 0.9:
+            print(f"[parse] WARNING: only {100*frac:.0f}% of kernel time attributed to NVTX phases — "
+                  "the per-phase split may be unreliable (NVTX/schema drift or an opaque graph).")
         print(f"[parse] system: {s['kernels_per_infer']} kernels/infer via {s['graph_launches_per_infer']} graph "
               f"+ {s['eager_launches_per_infer']} eager launches; GPU-busy {s['gpu_busy_ms_per_infer']:.2f}ms; "
               f"non-GPU {s.get('non_gpu_pct', float('nan')):.1f}%; SM-coverage {s.get('sm_coverage_weighted', 0):.2f}")

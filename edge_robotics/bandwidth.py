@@ -37,7 +37,9 @@ def conditioning_transfer(shape: ModelShape, scheme: QuantScheme | None = None, 
 
     kv_bytes = depth * 2 * shape.prefix_len * kvh * hd * shape.batch * kv_b   # K and V, all layers
     mask_bytes = shape.prefix_len * shape.batch                              # 1 byte/token pad mask
-    state_bytes = shape.action_dim * shape.batch * 4                         # fp32 proprio state (pi0)
+    # Only pi0 ships a raw state token (its continuous suffix token). pi05 carries state IN the prompt
+    # (already inside the KV cache) or not at all (pi05_libero), so nothing extra crosses the wire.
+    state_bytes = (shape.action_dim * shape.batch * 4) if not shape.pi05 else 0
     total = kv_bytes + mask_bytes + state_bytes
     # Alternative seam: vision on server, gemma_2b prefill + action on edge -> ship image embeddings.
     vision_embeds_bytes = shape.n_images * SIGLIP["tokens"] * width * shape.batch * _bytes_of(scheme.activations)

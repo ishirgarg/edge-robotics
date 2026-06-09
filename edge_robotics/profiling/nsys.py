@@ -13,8 +13,8 @@ nvidia-native mechanisms read back from a single nsys capture:
        any NVTX window pushed at replay time, so the split collapses. The torch backend is
        structured accordingly (see systems/openpi_torch.py).
   2. Kernel-family buckets (`cuda_gpu_kern_sum`) -> every GPU kernel classified into
-       attention / gemm / conv / elementwise / other by name. Backend-agnostic; the only option
-       for an opaque third-party fused graph (realtime-vla) that can't be NVTX-split.
+       attention / gemm / conv / quantize / elementwise / other by name. Backend-agnostic; a useful
+       cross-cut for any backend (and the fallback for a truly opaque fused graph with no NVTX split).
 
 In-process side (this file): helpers the profiled script calls to bracket exactly one steady-state
 region for nsys (`profiler_capture`, paired with `nsys --capture-range=cudaProfilerApi`) and to
@@ -141,11 +141,19 @@ def parse_nvtx_gpu_proj(rep_path: str, *, iters: int, phases: tuple[str, ...]) -
             name = str(r.get("Range", "")).lstrip(":").strip()
             if name in per:
                 per[name] += _f(r, "Total Proj Time (ns)") / 1e6 / n  # ns -> ms/infer
-        # Total GPU kernel time (denominator) from the kernel summary for an honest attributed_frac.
+        # Denominator for an honest attributed_frac. The numerator (NVTX GPU projection) counts
+        # kernels + memcpy + memset within each range, so the denominator must include BOTH kernel
+        # time (cuda_gpu_kern_sum) AND GPU memory-op time (cuda_gpu_mem_time_sum) — otherwise
+        # attributed_frac can exceed 1.0 (the memops show up in the numerator but not the denominator).
         total_gpu_ms = 0.0
         try:
             for r in _run_stats_csv(rep_path, "cuda_gpu_kern_sum"):
                 total_gpu_ms += _f(r, "Total Time (ns)") / 1e6 / n
+            try:
+                for r in _run_stats_csv(rep_path, "cuda_gpu_mem_time_sum"):
+                    total_gpu_ms += _f(r, "Total Time (ns)") / 1e6 / n
+            except Exception:  # noqa: BLE001  — memops report optional; kernels dominate the basis
+                pass
         except Exception:  # noqa: BLE001
             total_gpu_ms = sum(per.values())
         attributed = sum(per.values())
@@ -175,7 +183,7 @@ def parse_kernel_buckets(rep_path: str, *, iters: int, top: int = 25) -> dict:
     """Classify every GPU kernel into attention/gemm/conv/elementwise/other (ms/infer).
 
     Backend-agnostic and graph-safe (nsys reports real kernel names even inside CUDA graphs); the
-    only attribution available for an opaque fused graph that can't be NVTX-split.
+    a backend-agnostic cross-cut, and the fallback for a truly opaque fused graph with no NVTX split.
     """
     try:
         rows = _run_stats_csv(rep_path, "cuda_gpu_kern_sum")

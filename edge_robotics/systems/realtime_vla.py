@@ -13,9 +13,9 @@ the capture is numerically identical to the single graph; only the launch count 
 We do this from THIS wrapper without editing the vendored repo. The original single graph
 (`infer.forward`) is kept as the `infer_native` cross-check.
 
-  * infer_segmented -> [vision][vlm][action] sub-graph replays + NVTX  (headline + the split)
-  * infer_native    -> the repo's own single captured graph            (cross-check)
-  * component_profiler -> each sub-graph replayed standalone           (per-component, graphs ON)
+  * infer_native    -> the repo's own single captured graph (the deployed path)  = HEADLINE latency
+  * infer_segmented -> [vision][vlm][action] sub-graph replays + NVTX = the within-run BREAKDOWN
+  * component_profiler -> each sub-graph replayed standalone (secondary cross-check, graphs ON)
 
 nsys `nvtx_gpu_proj_sum` then attributes GPU time per phase; kernel-family buckets are also reported.
 
@@ -249,9 +249,10 @@ class RealtimeVlaSystem(ProfiledSystem):
 
         meta = {
             "backend": "torch-triton",
-            "attribution": "nsys NVTX GPU projection over per-stage CUDA sub-graphs (graphs ON); "
-            "E2E = segmented sub-graph replays (single captured graph reported as cross-check)",
+            "attribution": "headline = the repo's single captured graph (deployed); component split = "
+            "nsys NVTX GPU projection over per-stage CUDA sub-graphs (graphs ON)",
             "checkpoint": ckpt_resolved,
+            "real_weights": checkpoint != "random",
             "pi05": True,
             "discrete_state_input": discrete,
             "proprioception": "prompt_discrete" if discrete else "none",

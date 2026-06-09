@@ -33,7 +33,8 @@ def _phase_line(order: tuple[str, ...], cells: list[str]) -> str:
 
 
 def render_summary(meta: dict, result: dict) -> str:
-    order = tuple(meta.get("nvtx_phases") or ("vision", "vlm", "action"))
+    _ph = meta.get("nvtx_phases")  # [] (opaque graph) stays empty; missing falls back to the default
+    order = tuple(_ph) if _ph is not None else ("vision", "vlm", "action")
     lines: list[str] = []
     lines.append(
         f"Device: {meta.get('device_kind','?')} | system={meta.get('system','?')} | "
