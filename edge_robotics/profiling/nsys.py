@@ -11,7 +11,7 @@ nvidia-native mechanisms read back from a single nsys capture:
        is pushed/popped in EAGER glue AROUND the call (never inside the compiled region) — a
        single fused graph launches all its kernels under one `cudaGraphLaunch` that falls outside
        any NVTX window pushed at replay time, so the split collapses. The torch backend is
-       structured accordingly (see systems/pi05_openpi_torch.py).
+       structured accordingly (see systems/openpi_torch.py).
   2. Kernel-family buckets (`cuda_gpu_kern_sum`) -> every GPU kernel classified into
        attention / gemm / conv / elementwise / other by name. Backend-agnostic; the only option
        for an opaque third-party fused graph (realtime-vla) that can't be NVTX-split.
@@ -37,12 +37,20 @@ import torch
 
 # Kernel-name -> family. First match wins, so ORDER MATTERS (specific before generic). Heuristic
 # and brittle by nature — always sanity-check the size of the "other" bucket before trusting it.
+# Covers cuBLAS/cutlass/cuDNN (openpi-torch), Triton (realtime-vla), and quantized kernels.
 _KERNEL_FAMILIES: list[tuple[str, tuple[str, ...]]] = [
-    ("attention", ("flash", "fmha", "sdpa", "attention", "softmax", "scaled_dot")),
-    ("gemm", ("gemm", "cutlass", "cublas", "addmm", "bmm", "_mm", "matmul", "wgrad", "dgrad", "sgemm", "hgemm")),
+    # quantize/dequantize/rescale kernels are pure quantization OVERHEAD — surface them rather than
+    # bury them in "other". First, so an fp8/int8 cast isn't swallowed by a later 'gemm' match.
+    ("quantize", ("quant", "dequant", "to_fp8", "to_int8", "fp8_cast", "rescale", "dynamic_scale")),
+    # 'attn' + realtime-vla's QK^T kernel (matmul_abT_scale) before 'gemm' so attention isn't called gemm.
+    ("attention", ("flash", "fmha", "sdpa", "attention", "attn", "softmax", "scaled_dot", "abt_scale")),
+    ("gemm", ("gemm", "cutlass", "cublas", "addmm", "bmm", "_mm", "matmul", "wgrad", "dgrad", "sgemm",
+              "hgemm", "igemm", "imma", "dp4a", "i8i8", "s8s8", "marlin", "awq", "machete")),
     ("conv", ("conv", "cudnn", "nchw", "nhwc", "implicit_gemm", "winograd")),
+    # NOTE: no bare 'triton' here — it forced every Triton kernel into elementwise; inductor's fused
+    # elementwise kernels still match via 'fused'/'add'/'mul', while Triton matmul/attn route correctly.
     ("elementwise", ("elementwise", "vectorized", "silu", "gelu", "rms", "norm", "layer_norm",
-                     "triton", "copy", "cast", "add", "mul", "fused")),
+                     "copy", "cast", "add", "mul", "fused")),
 ]
 
 

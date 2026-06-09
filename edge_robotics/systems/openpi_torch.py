@@ -23,13 +23,18 @@ the KV cache, masks, state) are `.clone()`d out of each graph's static pool and
 `cudagraph_mark_step_begin()` is called before each graph invocation, as CUDA-graph trees require.
 
 Three things this backend exposes (see base.LoadedSystem):
-  * infer_segmented — the per-phase-graph E2E with NVTX (headline wall + the nsys split vehicle).
-  * infer_native    — openpi's own single `torch.compile(sample_actions)` (cross-check; the wall
-                      gap vs segmented is the segmentation overhead).
-  * component_profiler — each phase timed standalone in its graphs-on form (ms/infer).
+  * infer_native    — openpi's own single `torch.compile(sample_actions, mode="max-autotune")`, the
+                      FAITHFUL deployed path -> the HEADLINE latency/throughput.
+  * infer_segmented — the same inference as separately-compiled per-phase graphs glued in eager
+                      python with NVTX ranges -> the within-run nsys component split (BREAKDOWN
+                      VEHICLE; its wall carries glue/clone overhead, gap vs native = segmentation cost).
+  * component_profiler — each phase timed standalone in its graphs-on form (secondary cross-check).
 
-Random-init weights (latency is value-independent); no JAX->torch checkpoint conversion. Requires
-openpi's patched transformers (transformers_replace, see install.sh); PI0Pytorch.__init__ checks it.
+Config is DERIVED from openpi's training registry (`get_config(name).model`), so every pi0/pi05 x
+dataset config (pi0_droid, pi0_aloha, pi05_droid, pi05_aloha, pi05_libero, ...) works unchanged.
+checkpoint="random" -> random-init (latency is value-independent); a path -> converted torch weights
+(for value-dependent studies / faithful real-weights runs). Latency is identical either way.
+Requires openpi's patched transformers (transformers_replace, see install.sh).
 """
 
 from __future__ import annotations
@@ -43,13 +48,11 @@ import torch
 from ..profiling.nsys import nvtx_range
 from .base import LoadedSystem, ProfiledSystem
 
-# pi-0.5 configs. Mirrors openpi training/config.py; kwargs go straight to Pi0Config. (Moved here
-# from the deleted JAX backend — this is now the only consumer.)
-PI05_REGISTRY: dict[str, dict] = {
-    "pi05_base": dict(pi05=True),  # action_horizon=50 (default)
-    "pi05_aloha": dict(pi05=True),
-    "pi05_droid": dict(pi05=True, action_horizon=15),
-    "pi05_libero": dict(pi05=True, action_horizon=10, discrete_state_input=False),
+# Config resolution. PI0Pytorch is fully config-driven, so we DERIVE the config straight from
+# openpi's own training registry (`get_config(name).model`): every pi0/pi05 x dataset config works
+# with zero per-config code here and can never drift from openpi's numbers. _LOCAL_CONFIGS is ONLY
+# for synthetic configs openpi doesn't ship (fast pipeline smoke tests).
+_LOCAL_CONFIGS: dict[str, dict] = {
     # tiny model for fast pipeline smoke tests (no checkpoint needed; use --checkpoint random)
     "debug_pi05": dict(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
 }
@@ -58,13 +61,50 @@ PHASE_SCOPES = ("vision", "vlm", "action")
 _TOKENS_PER_IMAGE = 256
 
 
-class Pi05OpenpiTorchSystem(ProfiledSystem):
+def _resolve_config(config_name: str, prompt_len: int | None):
+    """Build the Pi0Config for `config_name`, faithful to how openpi defines/deploys it.
+
+    Derives from openpi `get_config(name).model` (so pi0/pi05 x any dataset works with no new code);
+    falls back to _LOCAL_CONFIGS for synthetic names openpi doesn't ship. `prompt_len` is None to
+    keep the config's native max_token_len (pi0=48, pi05=200 — "as trained"), or an int to override
+    it for a sweep. Compilation is disabled (pytorch_compile_mode=None) — this backend compiles
+    per-phase itself and wraps sample_actions separately for the native cross-check.
+    """
+    import dataclasses
+
+    from openpi.models.pi0_config import Pi0Config
+
+    if config_name in _LOCAL_CONFIGS:
+        base = Pi0Config(**_LOCAL_CONFIGS[config_name])
+    else:
+        from openpi.training import config as _config  # heavy import; only on the real path
+
+        base = _config.get_config(config_name).model  # raises with a close-match hint if unknown
+        if not isinstance(base, Pi0Config):
+            raise ValueError(f"config '{config_name}' model is {type(base).__name__}, not Pi0Config; "
+                             "this backend profiles the pi0/pi05 family only.")
+    overrides: dict = {"pytorch_compile_mode": None}
+    if prompt_len is not None:
+        overrides["max_token_len"] = int(prompt_len)
+    return dataclasses.replace(base, **overrides)
+
+
+def _proprioception_kind(cfg) -> str:
+    """How the proprioceptive state enters this model: a continuous token in the action-expert
+    SUFFIX (pi0), discretized tokens folded INTO THE PROMPT (pi05 w/ discrete_state_input), or
+    nowhere (pi05 w/o discrete_state_input, e.g. pi05_libero)."""
+    if not cfg.pi05:
+        return "suffix_state"
+    return "prompt_discrete" if cfg.discrete_state_input else "none"
+
+
+class OpenpiTorchSystem(ProfiledSystem):
     def load(
         self,
         *,
         config_name: str,
         checkpoint: str,
-        prompt_len: int,
+        prompt_len: int | None,
         num_steps: int,
         batch_size: int,
     ) -> LoadedSystem:
@@ -73,12 +113,9 @@ class Pi05OpenpiTorchSystem(ProfiledSystem):
         os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
         from openpi.models import model as _model
-        from openpi.models.pi0_config import Pi0Config
         from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
         from openpi.shared import array_typing as at
 
-        if config_name not in PI05_REGISTRY:
-            raise ValueError(f"unknown config_name '{config_name}'. known: {sorted(PI05_REGISTRY)}")
         if not torch.cuda.is_available():
             raise RuntimeError("openpi-torch needs a CUDA GPU (torch.cuda.is_available() is False).")
         # checkpoint == "random": random-init (latency is value-independent — the default for pure
@@ -93,20 +130,20 @@ class Pi05OpenpiTorchSystem(ProfiledSystem):
                 raise FileNotFoundError(f"checkpoint not found: {real_ckpt} (expected a converted torch "
                                         "checkpoint; run scripts/get_pi05_libero_torch.py)")
 
-        # Two compile modes, both CUDA-graph backed:
-        #  * segmented breakdown (OPENPI_TORCH_COMPILE_MODE) — default reduce-overhead: compiles fast
-        #    and the component %-split is mode-insensitive, so this keeps the breakdown cheap.
-        #  * native cross-check (OPENPI_TORCH_NATIVE_COMPILE_MODE) — default max-autotune, which is
-        #    openpi's OWN Pi0Config default (pytorch_compile_mode="max-autotune"). This makes the
-        #    native E2E a FAITHFUL "fully-optimized original" baseline, exactly as openpi ships it.
-        compile_mode = os.environ.get("OPENPI_TORCH_COMPILE_MODE", "reduce-overhead")
+        # Two compile modes, BOTH default to max-autotune — openpi's OWN Pi0Config default and the
+        # mode it actually deploys — for maximum fidelity (the user's hard constraint). The native
+        # path is the faithful headline; the segmented per-phase graphs are the breakdown vehicle and
+        # are compiled at the SAME mode so the per-phase kernels (and the roofline efficiency drawn
+        # from them) are the deployed kernels, and seg-vs-native is a clean segmentation-overhead
+        # measure. Override OPENPI_TORCH_COMPILE_MODE=reduce-overhead only for fast iteration.
+        compile_mode = os.environ.get("OPENPI_TORCH_COMPILE_MODE", "max-autotune")
         native_mode = os.environ.get("OPENPI_TORCH_NATIVE_COMPILE_MODE", "max-autotune")
         graphs_on = compile_mode.lower() not in ("", "none", "off", "eager")
         native_graphs = native_mode.lower() not in ("", "none", "off", "eager")
 
         # Build the model with NO openpi-side compile — we compile per-phase ourselves (segmented)
-        # and separately wrap sample_actions for the native cross-check.
-        cfg = Pi0Config(**PI05_REGISTRY[config_name], max_token_len=prompt_len, pytorch_compile_mode=None)
+        # and separately wrap sample_actions for the native cross-check. Config DERIVED from openpi.
+        cfg = _resolve_config(config_name, prompt_len)
         device = torch.device("cuda")
         # Move to device ONLY (no dtype): PI0Pytorch.__init__ already set openpi's deliberate MIXED
         # precision (bf16 weights, fp32 embeddings/norms/projections). A blanket .to(bf16) would
@@ -124,7 +161,7 @@ class Pi05OpenpiTorchSystem(ProfiledSystem):
             if real_missing:
                 raise RuntimeError(f"real checkpoint load left {len(real_missing)} weights uninitialized, "
                                    f"e.g. {real_missing[:5]} — conversion/config mismatch?")
-            print(f"[pi05_openpi_torch] loaded REAL weights from {real_ckpt} "
+            print(f"[openpi_torch] loaded REAL weights from {real_ckpt} "
                   f"({len(missing)} missing/{len(unexpected)} unexpected keys, both expected-small)")
 
         # openpi sets `_attn_implementation="eager"` INSIDE sample_actions/denoise_step. Pull it out
@@ -292,8 +329,8 @@ class Pi05OpenpiTorchSystem(ProfiledSystem):
 
         meta = {
             "backend": "openpi-torch",
-            "attribution": "nsys NVTX GPU projection over per-phase CUDA graphs (graphs ON); "
-            "E2E = segmented per-phase graphs (native single-compile reported as cross-check)",
+            "attribution": "headline = native single-compile (max-autotune) E2E; component split = "
+            "nsys NVTX GPU projection over per-phase CUDA graphs (graphs ON, same compile mode)",
             "checkpoint": "random-init" if real_ckpt is None else real_ckpt,
             "real_weights": real_ckpt is not None,
             "action_horizon": int(cfg.action_horizon),
@@ -305,7 +342,13 @@ class Pi05OpenpiTorchSystem(ProfiledSystem):
             "paligemma_variant": cfg.paligemma_variant,
             "action_expert_variant": cfg.action_expert_variant,
             "pi05": bool(cfg.pi05),
+            "discrete_state_input": bool(cfg.discrete_state_input),
+            "proprioception": _proprioception_kind(cfg),
             "dtype": cfg.dtype,
+            # Matmul/quantization axis (bf16 today; the roofline reads this). The real model is
+            # deliberately MIXED (bf16 weights, fp32 embeddings/norms/projections) — this names the
+            # dominant matmul precision, not a uniform cast.
+            "compute_dtype": cfg.dtype,
             "compile_mode": compile_mode if graphs_on else "eager",
             "native_compile_mode": native_mode if native_graphs else "eager",
             "graphs_on": graphs_on,
@@ -315,9 +358,9 @@ class Pi05OpenpiTorchSystem(ProfiledSystem):
         }
 
         return LoadedSystem(
-            name="pi05_openpi_torch",
+            name="openpi_torch",
             config_name=config_name,
-            prompt_len=prompt_len,
+            prompt_len=int(cfg.max_token_len),  # effective max_token_len ("as trained" unless overridden)
             num_steps=num_steps,
             batch_size=batch_size,
             infer_segmented=infer_segmented,

@@ -35,7 +35,7 @@ import subprocess
 
 from .nsys import _family_of, nsys_bin
 
-_FAMILY_ORDER = ("attention", "gemm", "conv", "elementwise", "memory_ops", "other")
+_FAMILY_ORDER = ("attention", "gemm", "conv", "quantize", "elementwise", "memory_ops", "other")
 _TEMPLATE_ARGS = re.compile(r"<[^<>]*>")
 
 
@@ -134,6 +134,7 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
             durations_ns: list[int] = []
             busy_intervals: list[tuple[int, int]] = []
             smcov_num = smcov_den = 0.0  # kernel-time-weighted SM coverage
+            attributed_kernel_ns = 0     # kernel time landing in SOME phase (coverage signal)
 
             for corr, st, en, dname, sname, gx, gy, gz in cur.execute(
                 "SELECT correlationId, start, end, demangledName, shortName, gridX, gridY, gridZ "
@@ -146,6 +147,7 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
                 fam = _family_of(name)
                 p = phase_of(corr)
                 if p is not None:
+                    attributed_kernel_ns += dur
                     per_phase_family[p][fam] = per_phase_family[p].get(fam, 0.0) + dur
                     if fam == "gemm":
                         key = "gemv_memory" if _gemm_is_gemv(name) else "gemm_compute"
@@ -177,6 +179,11 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
             gpu_busy_ns, span_lo, span_hi = _merge_busy(busy_intervals)
             wall_ns = span_hi - span_lo
             n_kernels = len(durations_ns)
+            total_kernel_ns = sum(durations_ns)
+            # Fraction of kernel time that landed in SOME NVTX phase. If this is ~0 the per-phase
+            # split silently failed (NVTX/schema drift, or a backend with no phases) even though
+            # kernels exist — without this signal an all-empty split looks identical to a good one.
+            attributed_frac = (attributed_kernel_ns / total_kernel_ns) if total_kernel_ns else 0.0
 
         def msinf(ns: float) -> float:
             return ns / 1e6 / n
@@ -201,6 +208,9 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
             # Saturates at 1.0 once blocks>=SMs and does NOT capture intra-SM warp/register occupancy.
             "sm_coverage_weighted": (smcov_num / smcov_den) if smcov_den else None,
             "sm_count": sm_count,
+            # Coverage of the per-phase split: ~1.0 = every kernel attributed to a phase; near 0 =
+            # the NVTX projection failed (don't trust per_phase_family/gemm_split then).
+            "phase_attributed_frac": round(attributed_frac, 4),
         }
         # Real wall-clock overhead: PRISTINE (non-nsys) wall minus GPU-busy. A small NEGATIVE value
         # is possible (CUPTI slightly inflates GPU-busy vs the un-profiled run) — reported signed, not

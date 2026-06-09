@@ -22,22 +22,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-# NVTX phase names each backend's segmented path emits (used by `parse` without loading the model).
-# Empty tuple => opaque fused graph; breakdown degrades to kernel-family buckets only.
-SYSTEM_PHASES: dict[str, tuple[str, ...]] = {
-    "pi05_openpi_torch": ("vision", "vlm", "action"),
-    "pi05_realtimevla": ("vision", "vlm", "action"),
-}
+# Fallback NVTX phase names for the offline `parse`/`report` stages when the persisted meta lacks
+# them. The AUTHORITATIVE source is LoadedSystem.nvtx_phases, recorded into timing.json by `time`.
+_DEFAULT_PHASES: tuple[str, ...] = ("vision", "vlm", "action")
 
 
 @dataclass
 class Config:
     # --- required identity flags ---
-    system: Literal["pi05_realtimevla", "pi05_openpi_torch"]
-    """Which system: 'pi05_openpi_torch' (openpi's native PyTorch port; full NVTX phase split) or
-    'pi05_realtimevla' (dexmal/realtime-vla Triton; opaque graph, kernel-bucket split only)."""
+    system: Literal["openpi_torch", "realtime_vla", "pi05_openpi_torch", "pi05_realtimevla"]
+    """Backend to profile: 'openpi_torch' (openpi's native PyTorch port; serves any pi0/pi05 x
+    dataset config, full NVTX phase split) or 'realtime_vla' (dexmal/realtime-vla Triton; pi05 only,
+    NVTX split via re-captured per-stage sub-graphs). The 'pi05_*' names are accepted aliases."""
     config_name: str
-    """pi-0.5 config name (e.g. pi05_libero, pi05_droid, pi05_base, debug_pi05)."""
+    """openpi config name = model-family x dataset (e.g. pi0_droid, pi0_aloha, pi05_droid,
+    pi05_aloha, pi05_libero; debug_pi05 for a fast smoke test). Resolved via openpi get_config."""
     checkpoint: str
     """Checkpoint: local path/gs:// URI, or the literal 'random' for random-init (no download)."""
     gpu: int
@@ -49,8 +48,9 @@ class Config:
     SEPARATE process from `time` on purpose: openpi's single fused graph and the per-phase segmented
     graphs thrash the shared cudagraph pool if exercised together, so the native cross-check is run
     in isolation."""
-    prompt_len: int = 200
-    """max_token_len for this run (single value; sweeps are the shell's job)."""
+    prompt_len: int | None = None
+    """Override max_token_len for this run. None (default) uses the config's native value
+    ('as trained': pi0=48, pi05=200). Set an int only to sweep prompt length."""
     num_steps: int = 10
     """Flow-matching denoise steps."""
     warmup: int = 3
@@ -66,14 +66,14 @@ class Config:
 
 
 def _make_system(name: str):
-    if name == "pi05_realtimevla":
-        from .systems.pi05_realtimevla import Pi05RealtimeVlaSystem
+    if name in ("realtime_vla", "pi05_realtimevla"):
+        from .systems.realtime_vla import RealtimeVlaSystem
 
-        return Pi05RealtimeVlaSystem()
-    if name == "pi05_openpi_torch":
-        from .systems.pi05_openpi_torch import Pi05OpenpiTorchSystem
+        return RealtimeVlaSystem()
+    if name in ("openpi_torch", "pi05_openpi_torch"):
+        from .systems.openpi_torch import OpenpiTorchSystem
 
-        return Pi05OpenpiTorchSystem()
+        return OpenpiTorchSystem()
     raise ValueError(f"unknown system '{name}'")
 
 
@@ -185,14 +185,15 @@ def _environment_meta(config: Config) -> dict:
 def _top_meta(config: Config, loaded) -> dict:
     m = loaded.meta
     return {
-        "system": config.system,
+        "system": loaded.name,  # canonical backend id (config.system may be an alias)
         "config_name": config.config_name,
         "checkpoint": m.get("checkpoint"),
         "real_weights": m.get("real_weights", False),
         "device_kind": m.get("device_kind"),
         "n_devices": m.get("n_devices"),
-        "prompt_len": config.prompt_len,
-        "num_steps": config.num_steps,
+        # EFFECTIVE values actually run (a backend may resolve/lock these), not the raw request.
+        "prompt_len": loaded.prompt_len,
+        "num_steps": loaded.num_steps,
         "batch_size": config.batch_size,
         "warmup": config.warmup,
         "iters": config.iters,
@@ -202,13 +203,18 @@ def _top_meta(config: Config, loaded) -> dict:
         "backend": m.get("backend"),
         "backend_version": m.get("torch_version"),
         "attribution": m.get("attribution", "n/a"),
-        "nvtx_phases": list(SYSTEM_PHASES.get(config.system, ())),
-        "model_weight_dtype": m.get("dtype"),  # e.g. "bfloat16" — surfaced for quick reproducibility
+        # Authoritative phase identity from the loaded system; offline stages read this back.
+        "nvtx_phases": list(loaded.nvtx_phases),
+        "model_weight_dtype": m.get("dtype"),
+        "compute_dtype": m.get("compute_dtype", m.get("dtype")),
+        "proprioception": m.get("proprioception"),
+        "discrete_state_input": m.get("discrete_state_input"),
         "model": {
             k: m.get(k)
             for k in (
                 "action_horizon", "action_dim", "paligemma_variant", "action_expert_variant",
-                "dtype", "n_images", "prefix_len_nominal", "max_token_len", "pi05",
+                "dtype", "compute_dtype", "n_images", "prefix_len_nominal", "max_token_len", "pi05",
+                "discrete_state_input", "proprioception",
             )
         },
         "environment": _environment_meta(config),
@@ -298,20 +304,20 @@ def _run_parse(config: Config) -> None:
     from .profiling.nsys import parse_kernel_buckets, parse_nvtx_gpu_proj
 
     rep = config.nsys_rep or f"{config.output}.nsys-rep"
-    phases = SYSTEM_PHASES.get(config.system, ())
+    # Phases + pristine wall + SM count all come from timing.json (written by `time`); parse does not
+    # load the model. Phases are the loaded system's own nvtx_phases (authoritative), not a table.
+    timing = _read_json(f"{config.output}.timing.json") or {}
+    tmeta = timing.get("meta") or {}
+    phases = tuple(tmeta.get("nvtx_phases") or _DEFAULT_PHASES)
     breakdown = parse_nvtx_gpu_proj(rep, iters=config.iters, phases=phases) if phases else None
     buckets = parse_kernel_buckets(rep, iters=config.iters)
 
-    # Deep analysis needs the pristine wall (idle/overhead vs real latency) and the device SM count;
-    # both live in the already-written timing.json from the `time` stage.
-    timing = _read_json(f"{config.output}.timing.json") or {}
-    tmeta = timing.get("meta") or {}
     seg = timing.get("e2e_segmented_ms")
     pristine = sorted(seg)[len(seg) // 2] if seg else None
     sm = (((tmeta.get("environment") or {}).get("hardware") or {}).get("device") or {}).get(
         "multi_processor_count")
     kernel_analysis = analyze_sqlite(
-        rep, iters=config.iters, phases=phases or ("vision", "vlm", "action"),
+        rep, iters=config.iters, phases=phases,
         sm_count=int(sm) if sm else 84, pristine_wall_ms=pristine)
 
     payload = {"breakdown_nvtx": breakdown, "kernel_buckets": buckets, "kernel_analysis": kernel_analysis}
@@ -356,8 +362,12 @@ def _run_report(config: Config) -> None:
     # GPU time (nsys NVTX projection) and the pristine E2E wall -> MFU/MBU and how-far-from-ideal.
     bd_nvtx = breakdown.get("breakdown_nvtx") or {}
     phases_gpu_ms = bd_nvtx.get("phases_ms_per_infer") if bd_nvtx.get("ok") else None
-    seg = timing.get("e2e_segmented_ms")
-    e2e_wall = sorted(seg)[len(seg) // 2] if seg else None
+    # Roofline-vs-wall uses the DEPLOYED (native, headline) wall; per-phase GPU times come from the
+    # segmented nsys capture. Fall back to the segmented wall if the native cross-check wasn't run.
+    def _median(xs):
+        return sorted(xs)[len(xs) // 2] if xs else None
+
+    e2e_wall = _median(native.get("e2e_native_ms")) or _median(timing.get("e2e_segmented_ms"))
     try:
         roofline = _roofline.analyze(meta, phases_gpu_ms=phases_gpu_ms, e2e_wall_ms=e2e_wall)
     except Exception as exc:  # noqa: BLE001  — roofline is supplementary; never gate the core report
@@ -412,7 +422,12 @@ def main() -> None:
     import tyro
 
     config = tyro.cli(Config)
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(config.gpu))
+    # Hard-pin BEFORE any CUDA context is created: --gpu must win. Warn (don't silently honor) a
+    # conflicting pre-set value, which would otherwise run on the wrong GPU while meta records --gpu.
+    preset = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if preset not in (None, "", str(config.gpu)):
+        print(f"[cli] WARNING: CUDA_VISIBLE_DEVICES={preset!r} preset; overriding with --gpu {config.gpu}.")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(config.gpu)
     run(config)
 
 

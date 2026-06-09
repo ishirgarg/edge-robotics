@@ -27,8 +27,13 @@ def _phase_cells(phases_ms: dict | None, phases_pct: dict | None, order: tuple[s
     return out
 
 
+def _phase_line(order: tuple[str, ...], cells: list[str]) -> str:
+    """Render 'name=cell  name=cell ...' for an arbitrary phase list (no hardcoded phase names)."""
+    return "  " + "  ".join(f"{name}={cell}" for name, cell in zip(order, cells))
+
+
 def render_summary(meta: dict, result: dict) -> str:
-    order = ("vision", "vlm", "action")
+    order = tuple(meta.get("nvtx_phases") or ("vision", "vlm", "action"))
     lines: list[str] = []
     lines.append(
         f"Device: {meta.get('device_kind','?')} | system={meta.get('system','?')} | "
@@ -42,28 +47,32 @@ def render_summary(meta: dict, result: dict) -> str:
     nat = result.get("e2e_native_ms")
     seg_mode = meta.get("compile_mode")
     nat_mode = meta.get("native_compile_mode")
-    seg_tag = f", {seg_mode}" if seg_mode else ""
-    lines.append(f"E2E (segmented, headline{seg_tag}) : {_ms(seg)} ms   (p90 {_ms(seg,'p90')}, min {_ms(seg,'min')})")
+    # HEADLINE = the faithful deployed native path; segmented is the breakdown vehicle.
     if nat:
-        ov = result.get("segmentation_overhead_pct")
-        # Only call the gap "segmentation overhead" when both paths used the SAME compile mode;
-        # otherwise it also includes the mode difference, so label it neutrally.
-        same_mode = (seg_mode == nat_mode) or (seg_mode is None and nat_mode is None)
         nat_tag = f", {nat_mode}" if nat_mode else ""
+        lines.append(f"E2E (native deployed path, HEADLINE{nat_tag}): {_ms(nat)} ms   "
+                     f"(p90 {_ms(nat,'p90')}, min {_ms(nat,'min')})")
+    if seg:
+        seg_tag = f", {seg_mode}" if seg_mode else ""
+        ov = result.get("segmentation_overhead_pct")
+        # Only call the gap "segmentation overhead" when both paths used the SAME compile mode.
+        same_mode = (seg_mode == nat_mode) or (seg_mode is None and nat_mode is None)
         if ov is not None:
-            delta = f"  [segmentation {ov:+.1f}%]" if same_mode else f"  [Δ vs segmented {ov:+.1f}%, modes differ]"
+            delta = f"  [segmentation {ov:+.1f}%]" if same_mode else f"  [Δ vs native {ov:+.1f}%, modes differ]"
         else:
             delta = ""
-        lines.append(f"E2E (native repo-default fast path{nat_tag}): {_ms(nat)} ms{delta}")
+        label = "breakdown vehicle" if nat else "headline — native unavailable"
+        lines.append(f"E2E (segmented, {label}{seg_tag}): {_ms(seg)} ms{delta}")
     if result.get("freq_hz") is not None:
-        lines.append(f"Freq                      : {result['freq_hz']:.2f} Hz")
+        src = result.get("headline_source", "?")
+        lines.append(f"Freq (headline={src})     : {result['freq_hz']:.2f} Hz")
     lines.append("")
 
     bd = result.get("breakdown_nvtx")
     if bd:
         cells = _phase_cells(bd["phases_ms_per_infer"], bd.get("phases_pct"), order)
         lines.append("Component breakdown (nsys NVTX GPU projection, graphs ON):")
-        lines.append(f"  vision={cells[0]}  vlm={cells[1]}  action={cells[2]}")
+        lines.append(_phase_line(order, cells))
         # Honest cross-checks: the per-phase GPU projection should sum to ~the E2E wall and ~the
         # total GPU kernel time. (Σphases can slightly exceed kernel-sum: projection counts the full
         # per-range GPU-busy span incl. memops/overheads, kernel-sum counts kernels only.)
@@ -81,14 +90,14 @@ def render_summary(meta: dict, result: dict) -> str:
     comp = result.get("components_standalone")
     if comp:
         cells = _phase_cells(comp["phases_ms_per_infer"], comp.get("phases_pct"), order)
-        lines.append("Per-component standalone (graphs ON, isolated):")
-        lines.append(f"  vision={cells[0]}  vlm={cells[1]}  action={cells[2]}")
+        lines.append("Per-component standalone (graphs ON, isolated — secondary cross-check, no overlap):")
+        lines.append(_phase_line(order, cells))
 
     kb = result.get("kernel_buckets")
     if kb:
         b = kb["buckets_ms_per_infer"]
         pct = kb.get("buckets_pct", {})
-        order_k = ("attention", "gemm", "conv", "elementwise", "other")
+        order_k = ("attention", "gemm", "conv", "quantize", "elementwise", "other")
         parts = [f"{k}={b[k]:.2f}({pct.get(k,0):.0f}%)" for k in order_k if k in b]
         lines.append("Kernel-family buckets (nsys, graphs ON):")
         lines.append("  " + "  ".join(parts))
@@ -206,6 +215,9 @@ def write_outputs(output_prefix: str, meta: dict, result: dict) -> tuple[str, st
                 w.writerow(base + [metric, k, "" if v is None else f"{v:.4f}",
                                    "" if pct is None else f"{pct:.2f}"])
 
+        if result.get("headline_latency_ms") is not None:
+            w.writerow(base + ["e2e", "headline", f"{result['headline_latency_ms']:.4f}",
+                               result.get("headline_source", "")])
         seg = result.get("e2e_segmented_ms")
         if seg:
             w.writerow(base + ["e2e", "segmented", f"{seg['median']:.4f}", ""])

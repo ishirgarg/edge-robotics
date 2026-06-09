@@ -6,9 +6,8 @@ torch-free; run() imports torch lazily). Drives one of four modes (time/nsys/par
 shell wrappers (profile_one.sh, profile_sweep.sh) sequence them and wrap the `nsys` mode under
 `nsys profile`. Run from the repo root after `source env.sh`:
 
-    python scripts/profile_policy.py --system pi05_openpi_torch --config-name pi05_libero \
-        --checkpoint random --gpu 6 --prompt-len 200 --num-steps 10 --mode time \
-        --output out/run/profile
+    python scripts/profile_policy.py --system openpi_torch --config-name pi05_libero \
+        --checkpoint random --gpu 6 --num-steps 10 --mode time --output out/run/profile
 """
 
 import os

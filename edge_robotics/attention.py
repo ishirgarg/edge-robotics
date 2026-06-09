@@ -30,14 +30,13 @@ def load_real_model(checkpoint: str, config_name: str, *, prompt_len: int, devic
     import safetensors.torch as st
     import torch  # noqa: F401
 
-    from openpi.models.pi0_config import Pi0Config
     from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 
-    from .systems.pi05_openpi_torch import PI05_REGISTRY
+    from .systems.openpi_torch import _resolve_config
 
-    if config_name not in PI05_REGISTRY:
-        raise ValueError(f"unknown config_name '{config_name}'. known: {sorted(PI05_REGISTRY)}")
-    cfg = Pi0Config(**PI05_REGISTRY[config_name], max_token_len=prompt_len, pytorch_compile_mode=None)
+    # Same config derivation as the profiler backend (openpi get_config), so every pi0/pi05 x dataset
+    # config works here too. prompt_len overrides max_token_len for this study.
+    cfg = _resolve_config(config_name, prompt_len)
     model = PI0Pytorch(config=cfg).to(device).eval()
 
     path = checkpoint if checkpoint.endswith(".safetensors") else os.path.join(checkpoint, "model.safetensors")

@@ -39,8 +39,8 @@ import torch
 from ..profiling.nsys import nvtx_range
 from .base import LoadedSystem, ProfiledSystem
 
-# Mirrors the pi05_* entries in PI05_REGISTRY, mapped to realtime-vla's knobs. chunk_size ==
-# action_horizon; num_views == number of camera images. Gemma sizes are baked into the kernels.
+# realtime-vla's pi05 knobs per config (chunk_size == action_horizon; num_views == #camera images).
+# Gemma sizes / action_dim=32 / 10 flow steps are baked into the Triton kernels (pi05 only for now).
 RT_REGISTRY: dict[str, dict] = {
     "pi05_base": dict(num_views=3, chunk_size=50, discrete_state_input=True),
     "pi05_aloha": dict(num_views=3, chunk_size=50, discrete_state_input=True),
@@ -76,17 +76,21 @@ def _import_pi05_infer():
     return pi05_infer
 
 
-class Pi05RealtimeVlaSystem(ProfiledSystem):
+class RealtimeVlaSystem(ProfiledSystem):
     def load(
         self,
         *,
         config_name: str,
         checkpoint: str,
-        prompt_len: int,
+        prompt_len: int | None,
         num_steps: int,
         batch_size: int,
     ) -> LoadedSystem:
         import triton
+
+        # realtime-vla currently wraps pi05 only (RT_REGISTRY; the repo's Pi0Inference could add pi0
+        # but isn't wired yet). prompt_len=None -> the pi05 native max_token_len (200).
+        prompt_len = 200 if prompt_len is None else int(prompt_len)
 
         if config_name not in RT_REGISTRY:
             raise ValueError(f"unknown config_name '{config_name}'. known: {sorted(RT_REGISTRY)}")
@@ -96,7 +100,7 @@ class Pi05RealtimeVlaSystem(ProfiledSystem):
             raise ValueError("realtime-vla runs a single observation per forward (batch_size must be 1).")
         if num_steps != _FIXED_NUM_STEPS:
             print(
-                f"[pi05_realtimevla] NOTE: realtime-vla hard-locks flow steps to {_FIXED_NUM_STEPS}; "
+                f"[realtime_vla] NOTE: realtime-vla hard-locks flow steps to {_FIXED_NUM_STEPS}; "
                 f"--num-steps={num_steps} is ignored for this backend."
             )
 
@@ -139,7 +143,7 @@ class Pi05RealtimeVlaSystem(ProfiledSystem):
             )
             fwd_args = (images, noise, "pick up the object", np.zeros(8, dtype=np.int64)) if discrete else (images, noise)
             ckpt_resolved = str(checkpoint)
-            print("[pi05_realtimevla] NOTE: real-weights path is experimental/unvalidated.")
+            print("[realtime_vla] NOTE: real-weights path is experimental/unvalidated.")
 
         images_in, noise_in = fwd_args[0], fwd_args[1]
 
@@ -248,7 +252,9 @@ class Pi05RealtimeVlaSystem(ProfiledSystem):
             "attribution": "nsys NVTX GPU projection over per-stage CUDA sub-graphs (graphs ON); "
             "E2E = segmented sub-graph replays (single captured graph reported as cross-check)",
             "checkpoint": ckpt_resolved,
+            "pi05": True,
             "discrete_state_input": discrete,
+            "proprioception": "prompt_discrete" if discrete else "none",
             "action_horizon": chunk_size,
             "action_dim": 32,
             "max_token_len": int(prompt_len),
@@ -258,6 +264,7 @@ class Pi05RealtimeVlaSystem(ProfiledSystem):
             "paligemma_variant": "gemma_2b",
             "action_expert_variant": "gemma_300m",
             "dtype": "bfloat16",
+            "compute_dtype": "bfloat16",
             "num_steps_fixed": _FIXED_NUM_STEPS,
             "graphs_on": True,
             "device_kind": torch.cuda.get_device_name(0),
@@ -267,7 +274,7 @@ class Pi05RealtimeVlaSystem(ProfiledSystem):
         }
 
         return LoadedSystem(
-            name="pi05_realtimevla",
+            name="realtime_vla",
             config_name=config_name,
             prompt_len=prompt_len,
             num_steps=_FIXED_NUM_STEPS,

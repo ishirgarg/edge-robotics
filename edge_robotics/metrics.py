@@ -3,16 +3,19 @@
 One run == one (system, config, prompt_len). The result carries, all from the model's REAL
 graphs-on form:
 
-  - e2e_segmented : device-synced wall of the per-phase-graph E2E (headline). freq = 1000/median.
-  - e2e_native    : wall of openpi's native single-compile E2E (cross-check; may be absent). The
-                    gap segmented-vs-native is the segmentation overhead of running phases as
-                    separate graphs (the price of an NVTX-attributable breakdown).
+  - e2e_native    : device-synced wall of the deployed native single-compile (max-autotune) E2E.
+                    This is the HEADLINE latency/throughput (freq = 1000/median) — the latency the
+                    robot experiences, with no segmentation artifacts.
+  - e2e_segmented : wall of the per-phase-graph E2E (the BREAKDOWN VEHICLE; carries glue/clone
+                    overhead). The gap segmented-vs-native at the same compile mode is the
+                    segmentation overhead (the price of an NVTX-attributable breakdown).
   - breakdown_nvtx: GPU ms/infer per phase from nsys NVTX GPU projection (the component split).
   - kernel_buckets: GPU ms/infer per kernel family from nsys (graph-safe; the only split for an
                     opaque fused graph).
-  - components_standalone: each phase timed standalone in its graphs-on form (independent of E2E).
+  - components_standalone: each phase timed standalone (secondary cross-check; no cross-phase overlap).
 
-Anything not measured (e.g. no nsys rep yet) is left None; nothing is inferred.
+If the native cross-check wasn't run, the headline falls back to the segmented wall (flagged via
+`headline_source`). Anything not measured (e.g. no nsys rep yet) is left None; nothing is inferred.
 """
 
 from __future__ import annotations
@@ -56,14 +59,19 @@ def build_result(
     res: dict = {}
 
     if e2e_segmented:
-        seg = stats(e2e_segmented)
-        res["e2e_segmented_ms"] = seg
-        res["freq_hz"] = 1000.0 / seg["median"] if seg["median"] > 0 else float("nan")
+        res["e2e_segmented_ms"] = stats(e2e_segmented)
     if e2e_native:
         res["e2e_native_ms"] = stats(e2e_native)
 
     seg_med = res.get("e2e_segmented_ms", {}).get("median")
     nat_med = res.get("e2e_native_ms", {}).get("median")
+    # HEADLINE latency/throughput = the deployed native single-compile path (no segmentation
+    # artifacts). Fall back to the segmented wall only if the native cross-check wasn't run.
+    headline = nat_med or seg_med
+    if headline:
+        res["headline_latency_ms"] = headline
+        res["headline_source"] = "native" if nat_med else "segmented"
+        res["freq_hz"] = 1000.0 / headline if headline > 0 else float("nan")
     if seg_med and nat_med:
         res["segmentation_overhead_pct"] = 100.0 * (seg_med / nat_med - 1.0)
 
