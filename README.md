@@ -10,6 +10,16 @@ For each run it reports:
 - **E2E (ms / Freq)** — wall latency of the full inference (graphs on).
 - **Component breakdown** — Vision / VLM / Action GPU time from a single nsys capture.
 - **Per-component standalone** — each component timed on its own, also fully optimized (graphs on).
+- **Per-phase × kernel-family** — attention vs GEMM (weights/activations) vs elementwise vs memory
+  ops, *crossed with* the Vision/VLM/Action phases, plus a compute-GEMM vs memory-bound-GEMV split.
+  Answers "attention vs W/A, backbone vs action part."
+- **System & overhead** — kernels/infer, CUDA-graph vs eager launches, GPU-busy-vs-wall utilization,
+  launch-API overhead, SM-coverage. Answers "CUDA launch overheads, utilization."
+- **Roofline** — analytic ideal lower bound (`max(FLOPs/peak, Bytes/BW)` per operator, after
+  [NVlabs/vla-perf](https://github.com/NVlabs/vla-perf)) with arithmetic intensity, compute-vs-memory
+  bound, and **how far from ideal** we are (MFU/MBU, efficiency). Answers "compare with roofline."
+- **LIBERO attention study** *(separate tool)* — with the REAL pi05_libero weights, how the action
+  expert attends to vision vs language vs proprioception. See `scripts/attention_heatmaps.py`.
 
 Two backends (pick with `--system`):
 
@@ -85,6 +95,47 @@ the python brackets), so model load, compile, cudagraph capture and warmup are e
 
 ---
 
+## Bottleneck, overhead & roofline analysis
+
+The same single nsys capture (parsed from its `.sqlite`, `edge_robotics/profiling/kernel_analysis.py`)
+and an analytic model (`edge_robotics/roofline.py`) answer three questions beyond the phase split:
+
+**1. Attention vs weights/activations, backbone vs action.** Every GPU kernel is attributed to its
+phase (vision/vlm/action) AND its family (attention / gemm / elementwise / memory-ops) by the
+`correlationId → launch → NVTX-window` projection (the only thing that survives CUDA graphs — kernels
+run async, long after the eager NVTX range, so they're matched through the launch that issued them).
+The gemm bucket is further split into **compute-bound GEMM vs memory-bound GEMV** (cuBLAS dispatches
+GEMV for batch-1 decode). On A6000/L64, openpi-torch: vision and VLM are GEMM-dominated; the **action
+expert is ~40% memory-bound GEMV** (the batch-1 flow-matching decode).
+
+**2. CUDA launch overhead & utilization.** CUDA graphs replay **~5400 kernels via only ~12 graph
+launches + ~31 eager launches** per inference, so launch overhead is amortised to ~nothing:
+**non-GPU time is ~2% of wall** (the pipeline is GPU-bound). Reported: kernels/infer, graph vs eager
+launches, GPU-busy/wall utilization (~96%), launch-API CPU time (async-overlapped, off the critical
+path), mean/median kernel duration, and a time-weighted SM-coverage proxy (~0.87 — the tiny decode
+kernels don't fill all 84 SMs).
+
+**3. Roofline — how far from ideal.** Per operator `T = max(FLOPs/peak_compute, Bytes/peak_BW)`
+(after [NVlabs/vla-perf](https://github.com/NVlabs/vla-perf)), summed per phase, vs the A6000's
+154.8 dense-bf16 TFLOPS / 768 GB/s (ridge ≈ 202 FLOP/byte). pi-0.5 on A6000:
+
+| phase  | OI (FLOP/byte) | bound        | ideal ms | measured GPU ms | efficiency (MFU/MBU) |
+|--------|----------------|--------------|----------|------------------|----------------------|
+| vision | ~322           | **compute**  | ~4.6     | ~15.0            | 31% (MFU 28%)        |
+| vlm    | ~530           | **compute**  | ~22.3    | ~32.9            | 68% (MFU 67%)        |
+| action | ~7             | **memory**   | ~14.5    | ~35.3 (openpi)   | 41% (MBU 41%)        |
+
+The VLM prefill is the best-utilised (67% MFU). The **action expert is memory-bound** (tiny OI: 10
+query tokens re-reading all expert weights + the fp32 adaRMS modulation weights every denoise step) —
+and is where the headroom is: openpi-torch hits 41% of its memory roofline, while **realtime-vla's
+fused Triton kernels hit ~93%** of the same roofline (15.5 ms vs 35.3 ms) — the clearest concrete
+optimization signal in the study. End-to-end, the measured wall is ~50% of the analytic ideal.
+
+> Roofline hardware is auto-detected (A6000); override for other targets with
+> `EDGE_ROBOTICS_PEAK_BF16_TFLOPS` / `EDGE_ROBOTICS_MEM_BW_GBPS` (e.g. to model a Jetson at the edge).
+
+---
+
 ## Setup (conda only — no uv)
 
 ```bash
@@ -156,6 +207,40 @@ tokenizer** (random weights + random language embeds, like realtime-vla's `bench
 
 ---
 
+## Real pi05_libero weights & the LIBERO attention study
+
+Latency is value-independent, so the profiler defaults to `--checkpoint random`. But the **real
+trained weights** are needed for a faithful "deployed model" run and, crucially, for the **attention
+study** (random weights give meaningless attention). Fetch + convert the public checkpoint once:
+
+```bash
+source env.sh
+python scripts/get_pi05_libero_torch.py        # downloads gs://openpi-assets/checkpoints/pi05_libero
+                                                # (anon gcsfs, ~12GB) + converts JAX->torch safetensors
+```
+
+Then profile the real weights (identical latency, now a faithful artifact), or run the attention study:
+
+```bash
+# real-weights profiling run (the full deep stack, on the real deployed model):
+./profile_one.sh pi05_openpi_torch pi05_libero 200 6 out/real_libero_L200   # CHECKPOINT=<the converted dir>
+
+# attention heatmaps: how the action expert attends to vision vs language vs proprioception,
+# with the REAL weights on a REAL LIBERO frame (eager — an interpretability artifact, not a timing):
+python scripts/attention_heatmaps.py \
+    --checkpoint /scratch/ishirgarg/openpi_cache/pi05_libero_torch --gpu 6 --out out/attention/pi05_libero
+```
+
+**What the attention study finds** (real pi05_libero, real LIBERO frame "put the white mug on the
+left plate…"): the action expert attends **~45% to language, ~32% to vision, ~23% to its own action
+tokens** — the task instruction drives action most. Within vision, the **wrist camera (~25%) far
+outweighs the base camera (~7%)**. The absent 3rd camera (masked) and padded language tokens get
+**0.0** (a built-in correctness check; per-query softmax mass sums to 1.0). **There is no
+proprioception modality**: pi05_libero sets `discrete_state_input=False`, so robot state is neither a
+prompt token nor a suffix token — the policy conditions on vision + language only. Outputs:
+`attention.json` + four plots (by-modality bar, layer×modality heatmap, attention-vs-denoise-step,
+and a spatial overlay of action→base-camera attention on the real image).
+
 ## Outputs
 
 - stdout: a per-run summary (E2E segmented + native, component breakdown, per-component standalone, buckets).
@@ -165,7 +250,9 @@ tokenizer** (random weights + random language embeds, like realtime-vla's `bench
   (torch/triton/transformers/openpi/jax/numpy/nsys), git commit + dirty flag, the invocation, and the
   result-affecting env vars. (Same `meta` the results carry, written as its own file.)
 - `<out>/profile.json`: `meta` (= the manifest above) + `result` (E2E stats mean/median/p50/p90/p99,
-  segmentation overhead, NVTX per-phase ms/%, kernel buckets + top kernels, per-component standalone ms).
+  segmentation overhead, NVTX per-phase ms/%, kernel buckets + top kernels, per-component standalone ms,
+  and the deep analysis: `kernel_analysis` (per-phase×family, gemm/gemv split, `system` overhead/util)
+  and `roofline` (per-phase OI/bound/ideal-ms + measured MFU/MBU/efficiency)).
 - `<out>/profile.csv`: long format — one row per `(metric, phase)` for plotting across a sweep.
 - `<out>/profile.nsys-rep`: the raw nsys capture; open in the Nsight Systems GUI for the full timeline.
 - `<out>/profile.{timing,breakdown}.json`: the intermediate per-stage artifacts.
@@ -185,3 +272,8 @@ tokenizer** (random weights + random language embeds, like realtime-vla's `bench
   `LoadedSystem` with `infer_segmented` + optional `infer_native`/`component_profiler` and
   `nvtx_phases`), and wire it into `cli._make_system` + `cli.SYSTEM_PHASES`.
 - The profiling primitives (`profiling/{walltime,nsys}.py`) are system-agnostic and reusable.
+- **Deep analysis** is system-agnostic too: `profiling/kernel_analysis.py` (per-phase×family + system
+  overhead from the nsys SQLite) and `roofline.py` (analytic lower bound from model dims + hardware
+  peaks) work for any system whose meta carries the model dims and which emits NVTX phases.
+- **Attention study**: `attention.py` (eager capture + modality bucketing + plots) and `libero_obs.py`
+  (real LIBERO frame → model `Observation` + token layout), driven by `scripts/attention_heatmaps.py`.

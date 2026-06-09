@@ -95,7 +95,93 @@ def render_summary(meta: dict, result: dict) -> str:
     elif result.get("kernel_buckets_error"):
         lines.append(f"Kernel buckets: unavailable ({result['kernel_buckets_error']})")
 
+    _render_kernel_analysis(result.get("kernel_analysis"), order, lines)
+    _render_roofline(result.get("roofline"), order, lines)
+
     return "\n".join(lines)
+
+
+def _render_kernel_analysis(ka: dict | None, order: tuple[str, ...], lines: list[str]) -> None:
+    """Per-phase x kernel-family (attention vs weights/activations), GEMM/GEMV split, and the
+    system-overhead / utilization summary (launch overhead, GPU-busy vs wall, SM-fill)."""
+    if not ka:
+        return
+    fam_ms = ka.get("per_phase_family_ms") or {}
+    fam_order = [f for f in ka.get("family_order", []) if any(f in fam_ms.get(p, {}) for p in order)]
+    if fam_ms and fam_order:
+        lines.append("")
+        lines.append("Per-phase x kernel-family (nsys SQLite projection, GPU ms/infer):")
+        head = "  " + f"{'phase':8}" + "".join(f"{f:>12}" for f in fam_order) + f"{'total':>10}"
+        lines.append(head)
+        for p in order:
+            fams = fam_ms.get(p)
+            if not fams:
+                continue
+            cells = "".join(f"{fams.get(f, 0.0):>12.2f}" for f in fam_order)
+            lines.append("  " + f"{p:8}" + cells + f"{sum(fams.values()):>10.2f}")
+    gs = ka.get("gemm_split_ms") or {}
+    if gs:
+        parts = [f"{p}: compute={d.get('gemm_compute',0):.2f} gemv={d.get('gemv_memory',0):.2f}"
+                 for p, d in gs.items() if (d.get('gemm_compute') or d.get('gemv_memory'))]
+        if parts:
+            lines.append("GEMM split — compute-bound GEMM vs memory-bound GEMV (batch-1 decode), ms/infer:")
+            lines.append("  " + "   |   ".join(parts))
+    s = ka.get("system") or {}
+    if s:
+        lines.append("System & overhead:")
+        lines.append(f"  {s.get('kernels_per_infer')} kernels/infer replayed by "
+                     f"{s.get('graph_launches_per_infer')} CUDA-graph + {s.get('eager_launches_per_infer')} "
+                     f"eager launches (graphs amortize launch overhead)")
+        util = s.get("gpu_utilization_under_nsys")
+        nonpct = s.get("non_gpu_pct")
+        seg = [f"GPU-busy={s.get('gpu_busy_ms_per_infer', 0):.2f}ms"]
+        if nonpct is not None:
+            seg.append(f"non-GPU(idle+overhead vs pristine wall)={s.get('non_gpu_ms_per_infer', 0):.2f}ms ({nonpct:.1f}%)")
+        if util is not None:
+            seg.append(f"util(under nsys)={100*util:.0f}%")
+        lines.append("  " + "  |  ".join(seg))
+        smc = s.get("sm_coverage_weighted")
+        lines.append(f"  mean kernel={s.get('mean_kernel_us') or 0:.1f}us  median={s.get('median_kernel_us') or 0:.1f}us"
+                     + (f"  |  SM-coverage (CTAs vs {s.get('sm_count')} SMs, time-wtd)={smc:.2f}" if smc is not None else ""))
+        lines.append(f"  launch-API CPU time={s.get('launch_api_cpu_ms_per_infer', 0):.2f}ms "
+                     "(async-overlapped with GPU; off the critical path)")
+
+
+def _render_roofline(rf: dict | None, order: tuple[str, ...], lines: list[str]) -> None:
+    """Analytic roofline ideal vs measured: per-phase OI / bound / ideal-ms / efficiency / MFU / MBU."""
+    if not rf:
+        return
+    hw = rf.get("hardware", {})
+    ph = rf.get("phases", {})
+    meas = (rf.get("measured") or {}).get("per_phase", {})
+    lines.append("")
+    lines.append(f"Roofline (ideal lower bound; {hw.get('name','?')} "
+                 f"{hw.get('bf16_tflops','?')} bf16 TFLOPS / {hw.get('mem_bw_gbps','?')} GB/s, "
+                 f"ridge OI={hw.get('ridge_point_oi',0):.0f} FLOP/byte):")
+    lines.append("  " + f"{'phase':8}{'OI':>9}{'bound':>9}{'ideal_ms':>10}{'meas_ms':>9}{'effic':>8}{'MFU':>7}{'MBU':>7}")
+    for p in order:
+        r = ph.get(p)
+        if not r:
+            continue
+        m = meas.get(p, {})
+        eff = m.get("efficiency")
+        mfu = m.get("mfu")
+        mbu = m.get("mbu")
+        lines.append("  " + f"{p:8}{r['arithmetic_intensity']:>9.0f}{r['bound']:>9}"
+                     f"{r['t_roofline_ms']:>10.2f}{(m.get('measured_gpu_ms') or 0):>9.2f}"
+                     + (f"{100*eff:>7.0f}%" if eff is not None else f"{'—':>8}")
+                     + (f"{100*mfu:>6.0f}%" if mfu is not None else f"{'—':>7}")
+                     + (f"{100*mbu:>6.0f}%" if mbu is not None else f"{'—':>7}"))
+    e = rf.get("e2e", {})
+    me = (rf.get("measured") or {}).get("e2e", {})
+    ideal = e.get("t_roofline_ms")
+    if ideal:
+        tail = f"  E2E ideal={ideal:.2f}ms (ideal {e.get('freq_hz_ideal',0):.1f} Hz)"
+        if me.get("measured_gpu_ms"):
+            tail += f"  vs GPU {me['measured_gpu_ms']:.2f}ms ({100*me.get('gpu_efficiency',0):.0f}% of ideal)"
+        if me.get("measured_wall_ms"):
+            tail += f"  vs wall {me['measured_wall_ms']:.2f}ms ({100*me.get('roofline_vs_wall',0):.0f}% of ideal)"
+        lines.append(tail)
 
 
 def write_outputs(output_prefix: str, meta: dict, result: dict) -> tuple[str, str]:
@@ -135,6 +221,33 @@ def write_outputs(output_prefix: str, meta: dict, result: dict) -> tuple[str, st
         if result.get("kernel_buckets"):
             emit("kernel_buckets", result["kernel_buckets"]["buckets_ms_per_infer"],
                  result["kernel_buckets"].get("buckets_pct"))
+
+        # Deep analysis: per-phase x family (phase tagged as "phase:family"), GEMM/GEMV split.
+        ka = result.get("kernel_analysis")
+        if ka:
+            for p, fams in (ka.get("per_phase_family_ms") or {}).items():
+                for fam, v in fams.items():
+                    w.writerow(base + ["per_phase_family", f"{p}:{fam}", f"{v:.4f}", ""])
+            for p, d in (ka.get("gemm_split_ms") or {}).items():
+                for k, v in d.items():
+                    w.writerow(base + ["gemm_split", f"{p}:{k}", f"{v:.4f}", ""])
+            for k, v in (ka.get("system") or {}).items():
+                if isinstance(v, (int, float)):
+                    w.writerow(base + ["system", k, f"{v:.4f}", ""])
+
+        # Roofline: ideal ms + efficiency/MFU/MBU per phase (pct column carries efficiency).
+        rf = result.get("roofline")
+        if rf:
+            meas = (rf.get("measured") or {}).get("per_phase", {})
+            for p, r in (rf.get("phases") or {}).items():
+                m = meas.get(p, {})
+                eff = m.get("efficiency")
+                w.writerow(base + ["roofline_ideal_ms", p, f"{r['t_roofline_ms']:.4f}",
+                                   "" if eff is None else f"{100*eff:.2f}"])
+                for metric, key in (("roofline_mfu", "mfu"), ("roofline_mbu", "mbu")):
+                    if m.get(key) is not None:
+                        w.writerow(base + [metric, p, f"{100*m[key]:.4f}", ""])
+                w.writerow(base + ["roofline_oi", p, f"{r['arithmetic_intensity']:.4f}", r["bound"]])
 
     return json_path, csv_path
 

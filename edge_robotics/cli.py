@@ -188,6 +188,7 @@ def _top_meta(config: Config, loaded) -> dict:
         "system": config.system,
         "config_name": config.config_name,
         "checkpoint": m.get("checkpoint"),
+        "real_weights": m.get("real_weights", False),
         "device_kind": m.get("device_kind"),
         "n_devices": m.get("n_devices"),
         "prompt_len": config.prompt_len,
@@ -207,7 +208,7 @@ def _top_meta(config: Config, loaded) -> dict:
             k: m.get(k)
             for k in (
                 "action_horizon", "action_dim", "paligemma_variant", "action_expert_variant",
-                "dtype", "n_images", "prefix_len_nominal", "max_token_len",
+                "dtype", "n_images", "prefix_len_nominal", "max_token_len", "pi05",
             )
         },
         "environment": _environment_meta(config),
@@ -291,7 +292,9 @@ def _run_nsys(config: Config) -> None:
 
 
 def _run_parse(config: Config) -> None:
-    """Parse the nsys report into NVTX per-phase split + kernel-family buckets (no model load)."""
+    """Parse the nsys report into NVTX per-phase split + kernel-family buckets + the DEEP analysis
+    (per-phase x kernel-family, GEMM/GEMV split, launch/utilization overheads) — all no model load."""
+    from .profiling.kernel_analysis import analyze_sqlite
     from .profiling.nsys import parse_kernel_buckets, parse_nvtx_gpu_proj
 
     rep = config.nsys_rep or f"{config.output}.nsys-rep"
@@ -299,7 +302,19 @@ def _run_parse(config: Config) -> None:
     breakdown = parse_nvtx_gpu_proj(rep, iters=config.iters, phases=phases) if phases else None
     buckets = parse_kernel_buckets(rep, iters=config.iters)
 
-    payload = {"breakdown_nvtx": breakdown, "kernel_buckets": buckets}
+    # Deep analysis needs the pristine wall (idle/overhead vs real latency) and the device SM count;
+    # both live in the already-written timing.json from the `time` stage.
+    timing = _read_json(f"{config.output}.timing.json") or {}
+    tmeta = timing.get("meta") or {}
+    seg = timing.get("e2e_segmented_ms")
+    pristine = sorted(seg)[len(seg) // 2] if seg else None
+    sm = (((tmeta.get("environment") or {}).get("hardware") or {}).get("device") or {}).get(
+        "multi_processor_count")
+    kernel_analysis = analyze_sqlite(
+        rep, iters=config.iters, phases=phases or ("vision", "vlm", "action"),
+        sm_count=int(sm) if sm else 84, pristine_wall_ms=pristine)
+
+    payload = {"breakdown_nvtx": breakdown, "kernel_buckets": buckets, "kernel_analysis": kernel_analysis}
     path = f"{config.output}.breakdown.json"
     _write_json(path, payload)
     if breakdown and breakdown.get("ok"):
@@ -311,6 +326,13 @@ def _run_parse(config: Config) -> None:
         print(f"[parse] NVTX breakdown unavailable: {(breakdown or {}).get('error')}")
     if buckets.get("ok"):
         print(f"[parse] kernel buckets: { {k: round(v,2) for k,v in buckets['buckets_ms_per_infer'].items()} }")
+    if kernel_analysis and kernel_analysis.get("ok"):
+        s = kernel_analysis["system"]
+        print(f"[parse] system: {s['kernels_per_infer']} kernels/infer via {s['graph_launches_per_infer']} graph "
+              f"+ {s['eager_launches_per_infer']} eager launches; GPU-busy {s['gpu_busy_ms_per_infer']:.2f}ms; "
+              f"non-GPU {s.get('non_gpu_pct', float('nan')):.1f}%; SM-coverage {s.get('sm_coverage_weighted', 0):.2f}")
+    elif kernel_analysis:
+        print(f"[parse] deep kernel analysis unavailable: {kernel_analysis.get('error')}")
     print(f"[parse] wrote {path}")
 
 
@@ -321,6 +343,8 @@ def _run_report(config: Config) -> None:
     from .metrics import build_result
     from .report import render_summary, write_outputs
 
+    from . import roofline as _roofline
+
     timing = _read_json(f"{config.output}.timing.json") or {}
     native = _read_json(f"{config.output}.timing-native.json") or {}
     breakdown = _read_json(f"{config.output}.breakdown.json") or {}
@@ -328,12 +352,26 @@ def _run_report(config: Config) -> None:
                                   "prompt_len": config.prompt_len, "num_steps": config.num_steps,
                                   "batch_size": config.batch_size, "iters": config.iters}
 
+    # Roofline: ideal lower bound from model dims + hardware peaks, merged with the MEASURED per-phase
+    # GPU time (nsys NVTX projection) and the pristine E2E wall -> MFU/MBU and how-far-from-ideal.
+    bd_nvtx = breakdown.get("breakdown_nvtx") or {}
+    phases_gpu_ms = bd_nvtx.get("phases_ms_per_infer") if bd_nvtx.get("ok") else None
+    seg = timing.get("e2e_segmented_ms")
+    e2e_wall = sorted(seg)[len(seg) // 2] if seg else None
+    try:
+        roofline = _roofline.analyze(meta, phases_gpu_ms=phases_gpu_ms, e2e_wall_ms=e2e_wall)
+    except Exception as exc:  # noqa: BLE001  — roofline is supplementary; never gate the core report
+        print(f"[report] WARNING: roofline computation failed ({exc}); omitting.")
+        roofline = None
+
     result = build_result(
         e2e_segmented=timing.get("e2e_segmented_ms"),
         e2e_native=native.get("e2e_native_ms"),
         breakdown_nvtx=breakdown.get("breakdown_nvtx"),
         kernel_buckets=breakdown.get("kernel_buckets"),
         components_standalone=timing.get("components_standalone"),
+        kernel_analysis=breakdown.get("kernel_analysis"),
+        roofline=roofline,
     )
     print("\n" + render_summary(meta, result))
     json_path, csv_path = write_outputs(config.output, meta, result)

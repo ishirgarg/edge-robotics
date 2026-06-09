@@ -81,11 +81,17 @@ class Pi05OpenpiTorchSystem(ProfiledSystem):
             raise ValueError(f"unknown config_name '{config_name}'. known: {sorted(PI05_REGISTRY)}")
         if not torch.cuda.is_available():
             raise RuntimeError("openpi-torch needs a CUDA GPU (torch.cuda.is_available() is False).")
+        # checkpoint == "random": random-init (latency is value-independent — the default for pure
+        # latency studies). Otherwise a path to a converted torch checkpoint (a dir with
+        # model.safetensors, or the .safetensors itself) — needed for VALUE-dependent analyses like
+        # attention heatmaps, and for a faithful "real deployed weights" profiling run. Latency is
+        # identical either way; only the weight VALUES differ. See scripts/get_pi05_libero_torch.py.
+        real_ckpt = None
         if checkpoint != "random":
-            raise ValueError(
-                "pi05_openpi_torch currently profiles random-init only (latency is value-independent). "
-                "Use --checkpoint random."
-            )
+            real_ckpt = checkpoint if checkpoint.endswith(".safetensors") else os.path.join(checkpoint, "model.safetensors")
+            if not os.path.exists(real_ckpt):
+                raise FileNotFoundError(f"checkpoint not found: {real_ckpt} (expected a converted torch "
+                                        "checkpoint; run scripts/get_pi05_libero_torch.py)")
 
         # Two compile modes, both CUDA-graph backed:
         #  * segmented breakdown (OPENPI_TORCH_COMPILE_MODE) — default reduce-overhead: compiles fast
@@ -106,6 +112,20 @@ class Pi05OpenpiTorchSystem(ProfiledSystem):
         # precision (bf16 weights, fp32 embeddings/norms/projections). A blanket .to(bf16) would
         # break it under torch.compile's pad_mm autotune.
         model = PI0Pytorch(config=cfg).to(device=device).eval()
+
+        if real_ckpt is not None:
+            # Load the REAL converted weights (fp32 safetensors -> the model's mixed bf16/fp32 params;
+            # load_state_dict copy_ casts dtype). strict=False: gemma_expert.embed_tokens is None and a
+            # few buffers differ — verify the load actually populated the transformer weights.
+            import safetensors.torch as _st
+
+            missing, unexpected = _st.load_model(model, real_ckpt, strict=False)
+            real_missing = [k for k in missing if "embed_tokens" not in k and "rotary" not in k]
+            if real_missing:
+                raise RuntimeError(f"real checkpoint load left {len(real_missing)} weights uninitialized, "
+                                   f"e.g. {real_missing[:5]} — conversion/config mismatch?")
+            print(f"[pi05_openpi_torch] loaded REAL weights from {real_ckpt} "
+                  f"({len(missing)} missing/{len(unexpected)} unexpected keys, both expected-small)")
 
         # openpi sets `_attn_implementation="eager"` INSIDE sample_actions/denoise_step. Pull it out
         # to here (set once) so the per-phase compile never graph-breaks on the config mutation.
@@ -274,7 +294,8 @@ class Pi05OpenpiTorchSystem(ProfiledSystem):
             "backend": "openpi-torch",
             "attribution": "nsys NVTX GPU projection over per-phase CUDA graphs (graphs ON); "
             "E2E = segmented per-phase graphs (native single-compile reported as cross-check)",
-            "checkpoint": "random-init",
+            "checkpoint": "random-init" if real_ckpt is None else real_ckpt,
+            "real_weights": real_ckpt is not None,
             "action_horizon": int(cfg.action_horizon),
             "action_dim": int(cfg.action_dim),
             "max_token_len": int(cfg.max_token_len),
@@ -283,6 +304,7 @@ class Pi05OpenpiTorchSystem(ProfiledSystem):
             "prefix_len_nominal": len(img_keys) * _TOKENS_PER_IMAGE + int(cfg.max_token_len),
             "paligemma_variant": cfg.paligemma_variant,
             "action_expert_variant": cfg.action_expert_variant,
+            "pi05": bool(cfg.pi05),
             "dtype": cfg.dtype,
             "compile_mode": compile_mode if graphs_on else "eager",
             "native_compile_mode": native_mode if native_graphs else "eager",

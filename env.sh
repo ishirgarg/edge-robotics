@@ -2,11 +2,14 @@
 # Activates the conda env and redirects all heavy caches to /scratch (home is ~20GB).
 
 # --- conda ---
-__CONDA="/scratch/ishirgarg/miniforge3"
-if [ -f "$__CONDA/etc/profile.d/conda.sh" ]; then
-  . "$__CONDA/etc/profile.d/conda.sh"
-  conda activate edge-robotics
-fi
+# Try known conda roots in order (first one that has the hook wins).
+for __CONDA in "/home/eecs/ishirgarg/miniconda3" "/scratch/ishirgarg/miniforge3"; do
+  if [ -f "$__CONDA/etc/profile.d/conda.sh" ]; then
+    . "$__CONDA/etc/profile.d/conda.sh"
+    conda activate edge-robotics
+    break
+  fi
+done
 
 # --- caches on /scratch (NOT on the 20GB home) ---
 export PIP_CACHE_DIR=/scratch/ishirgarg/pip-cache

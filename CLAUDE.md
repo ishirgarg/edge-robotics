@@ -63,3 +63,9 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## Additional Information
+
+- Whenever you write some significant code or perform a significant refactor, please launch 8 reviewer agents in parallel to review the code, surface any issues. Then you should fix the issues and relaunch independent agents, keep doing this until there are no issues in the code that would affect the outcome of this project. 
+- Use `nvidia-smi` to check which GPUs are free for testing code and running performance benchmarking\
+- You may need to conda activate edge-robotics to get the right dependencies loaded. When opening a new terminal also source ~/.bashrc yourself before continuing. 

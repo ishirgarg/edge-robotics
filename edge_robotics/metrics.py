@@ -49,6 +49,8 @@ def build_result(
     breakdown_nvtx: dict | None,
     kernel_buckets: dict | None,
     components_standalone: dict | None,
+    kernel_analysis: dict | None = None,
+    roofline: dict | None = None,
 ) -> dict:
     """Combine whatever measurements are present into one JSON-serializable result dict."""
     res: dict = {}
@@ -99,5 +101,19 @@ def build_result(
         }
     elif components_standalone is not None:
         res["components_standalone_error"] = components_standalone.get("error")
+
+    # Deep kernel/system analysis (per-phase x family, GEMM/GEMV split, launch/util overheads).
+    if kernel_analysis is not None and kernel_analysis.get("ok"):
+        res["kernel_analysis"] = {
+            k: kernel_analysis[k] for k in
+            ("per_phase_family_ms", "family_order", "gemm_split_ms", "system", "method")
+            if k in kernel_analysis
+        }
+    elif kernel_analysis is not None:
+        res["kernel_analysis_error"] = kernel_analysis.get("error")
+
+    # Analytic roofline lower bound + measured efficiency (MFU/MBU, ideal-vs-achieved).
+    if roofline is not None:
+        res["roofline"] = roofline
 
     return res
