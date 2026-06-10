@@ -1,20 +1,21 @@
-"""Build a REAL pi-0.5 observation from a real LIBERO frame.
+"""Build a pi0/pi05 observation (+ prefix token layout) for the attention study, per dataset.
 
 The latency profiler is value-independent and feeds zeros. The attention study is NOT — it needs the
-real trained weights AND a real observation (real camera image + real task instruction) for the
-attention pattern to mean anything. This module fetches one frame from the public LIBERO LeRobot
-dataset (`physical-intelligence/libero`, the same data openpi trains pi05_libero on) and assembles
-the model `Observation`, plus the exact prefix token layout the attention study buckets over.
+real trained weights AND a real/representative observation for the attention pattern to mean anything.
+`load_frame(config_name, ...)` returns a frame for the config's dataset: LIBERO uses a REAL frame from
+the public LeRobot dataset (`physical-intelligence/libero`); DROID/ALOHA use a representative frame
+(real task prompt + the dataset's true camera layout + state dim; synthetic-random pixels, flagged via
+image_source) since their training data isn't a single public parquet. `build_observation` then
+assembles the model `Observation` + the prefix token layout the study buckets over.
 
-Token layout it returns (for pi05_libero, 3 image slots x 256 SigLIP tokens + padded language):
-  [   0: 256) base camera        (attended)
-  [ 256: 512) left wrist camera  (attended)
-  [ 512: 768) right wrist        (zero-filled + MASKED — pi0 family masks the absent 3rd cam)
-  [ 768: 768+n_real) language    (the real task tokens; attended)
-  [768+n_real : 768+max_token_len) language PAD (masked)
-pi05_libero sets discrete_state_input=False, so proprioceptive state is NOT a prefix token and the
-pi05 action expert's suffix carries no state token either — there is no "proprioception" modality to
-attend to for this checkpoint (a finding, surfaced by the study).
+Token layout (3 image slots x 256 SigLIP tokens + padded language):
+  [   0: 256) base camera; [256:512) left wrist; [512:768) right wrist  — a slot is REAL when its
+  image is populated, else zero-filled + MASKED (LIBERO/DROID mask the 3rd cam; ALOHA uses all three).
+  [768 : 768+n_real) language; [768+n_real : 768+max_token_len) PAD (masked).
+Proprioception: pi05 with discrete_state_input folds discretized state tokens INTO the prompt — they
+are recovered and bucketed SEPARATELY from language (see _discrete_state_token_span). pi05_libero sets
+discrete_state_input=False -> no state token at all (proprioception absent). pi0 instead carries state
+as a continuous action-expert SUFFIX token (handled separately).
 """
 
 from __future__ import annotations
@@ -80,14 +81,57 @@ def load_libero_frame(episode: int = 0, frame: int = 0, *, parquet_path: str | N
         return np.asarray(v)
 
     prompt = _task_for_index(int(row["task_index"])) or "complete the task"
+    base, wristimg = _img(row["image"]), _img(row["wrist_image"])
     return {
-        "base_image": _img(row["image"]),
-        "wrist_image": _img(row["wrist_image"]),
+        # base + left wrist are real; the 3rd slot is absent (zero-filled + masked in build_observation).
+        "images": {"base_0_rgb": base, "left_wrist_0_rgb": wristimg},
+        "base_image": base,  # kept for the spatial-attention overlay plot
         "state": np.asarray(row["state"], dtype=np.float32),
-        "prompt": prompt,
-        "episode": int(episode),
-        "frame": int(frame),
+        "prompt": prompt, "dataset": "libero", "image_source": "real-lerobot",
+        "episode": int(episode), "frame": int(frame),
     }
+
+
+# Per-dataset observation spec (mirrors openpi's *Inputs transforms). The pi0 family always feeds 3
+# fixed SigLIP slots; a slot is REAL when populated, else zero-filled + masked. LIBERO/DROID use
+# base + one wrist (3rd slot masked); ALOHA uses all three (high + both wrists, none masked).
+_SLOTS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+_SHORT = {"base_0_rgb": "base", "left_wrist_0_rgb": "left_wrist", "right_wrist_0_rgb": "right_wrist"}
+_DATASET_SPECS = {
+    "libero": {"real_slots": ("base_0_rgb", "left_wrist_0_rgb"), "state_dim": 8,
+               "prompt": "pick up the object and place it on the plate"},
+    "droid":  {"real_slots": ("base_0_rgb", "left_wrist_0_rgb"), "state_dim": 8,
+               "prompt": "pick up the object and put it in the bin"},
+    "aloha":  {"real_slots": ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"), "state_dim": 14,
+               "prompt": "fold the towel and place it on the right"},
+}
+
+
+def _dataset_of(config_name: str) -> str:
+    for d in ("libero", "droid", "aloha"):
+        if d in config_name:
+            return d
+    return "libero"
+
+
+def load_frame(config_name: str, episode: int = 0, frame: int = 0) -> dict:
+    """Representative observation frame for the config's dataset, for the attention study.
+
+    LIBERO uses a REAL frame from its public LeRobot dataset. DROID/ALOHA use a representative frame
+    (real task prompt + the dataset's true camera layout + state dim; synthetic-random pixels —
+    flagged via `image_source`) since their training data isn't a single public parquet. The
+    attention MODALITY split, proprioception separation, and camera/state layout are faithful
+    regardless of dataset; only the spatial pixel content differs for DROID/ALOHA."""
+    dataset = _dataset_of(config_name)
+    if dataset == "libero":
+        return load_libero_frame(episode, frame)
+    spec = _DATASET_SPECS[dataset]
+    rng = np.random.default_rng(episode)
+    images = {s: rng.integers(0, 256, size=(_IMG_PX, _IMG_PX, 3), dtype=np.uint8) for s in spec["real_slots"]}
+    state = rng.uniform(-1.0, 1.0, size=spec["state_dim"]).astype(np.float32)
+    return {"images": images, "base_image": images["base_0_rgb"], "state": state,
+            "prompt": spec["prompt"], "dataset": dataset, "image_source": "synthetic-random",
+            "episode": int(episode), "frame": int(frame)}
 
 
 def build_observation(frame: dict, *, prompt_len: int, action_dim: int, device, discrete_state: bool):
@@ -112,13 +156,18 @@ def build_observation(frame: dict, *, prompt_len: int, action_dim: int, device, 
         arr = np.asarray(im, dtype=np.float32) / 255.0 * 2.0 - 1.0   # -> [-1, 1]
         return torch.from_numpy(arr).permute(2, 0, 1)[None].to(device)  # [1,3,H,W]
 
-    base = _to_tensor(frame["base_image"])
-    wrist = _to_tensor(frame["wrist_image"])
-    right = torch.zeros_like(base)  # absent 3rd camera, masked below
-    images = {"base_0_rgb": base, "left_wrist_0_rgb": wrist, "right_wrist_0_rgb": right}
-    image_masks = {"base_0_rgb": torch.ones(1, dtype=torch.bool, device=device),
-                   "left_wrist_0_rgb": torch.ones(1, dtype=torch.bool, device=device),
-                   "right_wrist_0_rgb": torch.zeros(1, dtype=torch.bool, device=device)}
+    # 3 fixed slots: a slot present in frame["images"] is REAL (mask True); an absent slot is
+    # zero-filled + masked False (LIBERO/DROID mask the 3rd cam; ALOHA populates all three).
+    frame_images = frame["images"]
+    images, image_masks, masked_cameras = {}, {}, []
+    for slot in _SLOTS:
+        if slot in frame_images:
+            images[slot] = _to_tensor(frame_images[slot])
+            image_masks[slot] = torch.ones(1, dtype=torch.bool, device=device)
+        else:
+            images[slot] = torch.zeros_like(next(iter(images.values())))  # base_0_rgb is always real & first
+            image_masks[slot] = torch.zeros(1, dtype=torch.bool, device=device)
+            masked_cameras.append(_SHORT[slot])
 
     tok = PaligemmaTokenizer(max_len=prompt_len)
     state8 = frame["state"]
@@ -155,7 +204,7 @@ def build_observation(frame: dict, *, prompt_len: int, action_dim: int, device, 
     layout = {
         "prefix_len": img_tokens + prompt_len,
         "cameras": {"base": (0, 256), "left_wrist": (256, 512), "right_wrist": (512, 768)},
-        "masked_cameras": ["right_wrist"],
+        "masked_cameras": masked_cameras,                    # absent slots (LIBERO/DROID: right_wrist; ALOHA: none)
         "language": language,                                # list of kv-intervals (excludes state)
         "language_pad": (lang_hi, img_tokens + prompt_len),
         "proprioception": proprioception,                    # (lo,hi) kv-range of state digits, or None
@@ -163,6 +212,8 @@ def build_observation(frame: dict, *, prompt_len: int, action_dim: int, device, 
         "n_real_language_tokens": n_real,
         "tokens_per_image": _TOKENS_PER_IMAGE,
         "prompt": frame["prompt"],
+        "dataset": frame.get("dataset"),
+        "image_source": frame.get("image_source"),
         "has_proprioception": proprioception is not None,
     }
     return obs, layout

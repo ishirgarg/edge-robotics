@@ -55,12 +55,13 @@ def load_real_model(checkpoint: str, config_name: str, *, prompt_len: int, devic
     return model, cfg
 
 
-def capture_action_attention(model, obs, *, num_steps: int, action_horizon: int, device) -> np.ndarray:
+def capture_action_attention(model, obs, *, num_steps: int, suffix_len: int, device) -> np.ndarray:
     """Run sample_actions and capture the action expert's attention probs.
 
-    Returns attn[num_steps, n_layers, heads, action_horizon, kv_len] (kv_len = prefix_len + suffix).
-    Captured by wrapping the module-global eager_attention_forward; only the suffix-query calls
-    (q_len == action_horizon) are kept, so the prefix VLM prefill attention is excluded.
+    Returns attn[num_steps, n_layers, heads, suffix_len, kv_len] (kv_len = prefix_len + suffix_len).
+    `suffix_len` is the action-expert query length: action_horizon for pi05, action_horizon+1 for pi0
+    (whose suffix prepends one continuous state token). Captured by wrapping the module-global
+    eager_attention_forward; only suffix-query calls (q_len == suffix_len) are kept, excluding prefill.
     """
     import torch
     import transformers.models.gemma.modeling_gemma as mg
@@ -70,7 +71,7 @@ def capture_action_attention(model, obs, *, num_steps: int, action_horizon: int,
 
     def patched(module, query, key, value, *args, **kwargs):
         out, w = orig(module, query, key, value, *args, **kwargs)
-        if query.shape[-2] == action_horizon:  # action-expert suffix queries (not the prefill)
+        if query.shape[-2] == suffix_len:  # action-expert suffix queries (not the prefill)
             li = getattr(module, "layer_idx", None)
             assert li is not None and li >= 0, f"expert attn module missing layer_idx ({li})"
             captures.append((int(li), w.detach().to(torch.float32).cpu().numpy()[0]))  # [heads,q,kv]
@@ -99,7 +100,7 @@ def capture_action_attention(model, obs, *, num_steps: int, action_horizon: int,
 # such tuples) via the layout. "language" excludes the discrete-state span; "proprioception" (when
 # present) is that span — for discrete_state pi05 it sits INSIDE the prompt, so language is two
 # intervals around it (see libero_obs.build_observation).
-def _modality_ranges(layout: dict, prefix_len: int, action_horizon: int) -> dict:
+def _modality_ranges(layout: dict, prefix_len: int, suffix_len: int, suffix_state: bool) -> dict:
     cams = layout["cameras"]
     ranges = {
         "vision_base": cams["base"],
@@ -107,22 +108,29 @@ def _modality_ranges(layout: dict, prefix_len: int, action_horizon: int) -> dict
         "vision_right_wrist(masked)": cams["right_wrist"],
         "language": layout["language"],                      # tuple OR list of intervals (sans state)
         "language_pad(masked)": tuple(layout["language_pad"]),
-        "action_self": (prefix_len, prefix_len + action_horizon),
     }
-    if layout.get("proprioception"):
-        ranges["proprioception"] = tuple(layout["proprioception"])
+    if suffix_state:
+        # pi0: the suffix prepends one continuous state token at kv index prefix_len; the action
+        # tokens (and their self-attention) follow it.
+        ranges["proprioception"] = (prefix_len, prefix_len + 1)
+        ranges["action_self"] = (prefix_len + 1, prefix_len + suffix_len)
+    else:
+        ranges["action_self"] = (prefix_len, prefix_len + suffix_len)
+        if layout.get("proprioception"):  # pi05 discrete: state span lives INSIDE the prompt
+            ranges["proprioception"] = tuple(layout["proprioception"])
     return ranges
 
 
-def bucket_attention(attn: np.ndarray, layout: dict, *, action_horizon: int) -> dict:
+def bucket_attention(attn: np.ndarray, layout: dict, *, action_horizon: int, suffix_state: bool = False) -> dict:
     """Fraction of attention mass on each modality — overall, per-layer, and per-denoise-step.
 
     attn rows are softmax probabilities (sum to 1 over kv per query), so the modality fractions sum
-    to ~1.0 — a built-in cross-check that the kv ranges tile the whole key axis.
+    to ~1.0 — a built-in cross-check that the kv ranges tile the whole key axis. `suffix_state` (pi0)
+    means the suffix's first token is the continuous proprioceptive state (bucketed as proprioception).
     """
-    n_steps, n_layers, heads, q, kv = attn.shape
+    n_steps, n_layers, heads, q, kv = attn.shape  # q = suffix_len (action_horizon [+1 for pi0])
     prefix_len = layout["prefix_len"]
-    ranges = _modality_ranges(layout, prefix_len, action_horizon)
+    ranges = _modality_ranges(layout, prefix_len, q, suffix_state)
 
     def mass(a, rng):  # sum prob mass over a kv range (tuple) or list of ranges, on a [...,kv] array
         intervals = rng if isinstance(rng, list) else [rng]
@@ -220,8 +228,11 @@ def make_plots(attn: np.ndarray, buckets: dict, layout: dict, frame: dict, outdi
 
 
 def analyze(*, checkpoint: str, config_name: str, gpu: int, num_steps: int, episode: int, frame_idx: int,
-            outdir: str, prompt_len: int = 200) -> dict:
-    """End to end: real model + real LIBERO frame -> attention buckets + plots + JSON."""
+            outdir: str, prompt_len: int | None = None) -> dict:
+    """End to end: real model + a real/representative frame -> attention buckets + plots + JSON.
+
+    prompt_len=None uses the config's native max_token_len ('as trained'). The dataset (and thus the
+    camera layout + whether proprioception is a separate bucket) is derived from config_name."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
     import torch
@@ -230,18 +241,21 @@ def analyze(*, checkpoint: str, config_name: str, gpu: int, num_steps: int, epis
 
     device = torch.device("cuda")
     model, cfg = load_real_model(checkpoint, config_name, prompt_len=prompt_len, device=device)
-    frame = libero_obs.load_libero_frame(episode, frame_idx)
+    eff_prompt_len = int(cfg.max_token_len)  # the effective length (native unless prompt_len overrode it)
+    frame = libero_obs.load_frame(config_name, episode, frame_idx)
     obs, layout = libero_obs.build_observation(
-        frame, prompt_len=prompt_len, action_dim=int(cfg.action_dim), device=device,
+        frame, prompt_len=eff_prompt_len, action_dim=int(cfg.action_dim), device=device,
         discrete_state=bool(cfg.discrete_state_input))
-    attn = capture_action_attention(model, obs, num_steps=num_steps,
-                                    action_horizon=int(cfg.action_horizon), device=device)
-    buckets = bucket_attention(attn, layout, action_horizon=int(cfg.action_horizon))
+    suffix_state = not bool(cfg.pi05)  # pi0 prepends a continuous proprioceptive state token to the suffix
+    suffix_len = int(cfg.action_horizon) + (1 if suffix_state else 0)
+    attn = capture_action_attention(model, obs, num_steps=num_steps, suffix_len=suffix_len, device=device)
+    buckets = bucket_attention(attn, layout, action_horizon=int(cfg.action_horizon), suffix_state=suffix_state)
     plots = make_plots(attn, buckets, layout, frame, outdir)
 
     result = {
-        "meta": {"checkpoint": checkpoint, "config_name": config_name, "prompt": frame["prompt"],
-                 "episode": episode, "frame": frame_idx, "num_steps": num_steps, "prompt_len": prompt_len,
+        "meta": {"checkpoint": checkpoint, "config_name": config_name, "dataset": frame.get("dataset"),
+                 "image_source": frame.get("image_source"), "prompt": frame["prompt"],
+                 "episode": episode, "frame": frame_idx, "num_steps": num_steps, "prompt_len": eff_prompt_len,
                  "discrete_state_input": bool(cfg.discrete_state_input),
                  "has_proprioception": layout["has_proprioception"], "layout": layout},
         "attention": buckets, "plots": plots,
