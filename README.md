@@ -314,20 +314,42 @@ the memory-bound action expert. Headline is the native deployed (max-autotune) p
 
 ## Evaluation (accuracy)
 
+Two complementary measures (the "both" eval): simulator-free action-error, and closed-loop sim success.
+
+**1. Offline action-error** (simulator-free) — runs the real inference path on sampled frames and compares
+the predicted action chunk to the dataset's ground-truth (normalized like training — quantile for pi05,
+z-score for pi0):
+
 ```bash
-# offline action-prediction error: predicted chunk vs dataset ground-truth, normalized space:
 python scripts/eval_offline.py --checkpoint /scratch/.../pi05_libero_torch \
     --config-name pi05_libero --gpu 0 --out out/eval/pi05_libero
 ```
 
-Offline action-error runs the real inference path on sampled frames and compares the predicted action
-chunk to the dataset's ground-truth (normalized like training — quantile for pi05, z-score for pi0).
-Measured **pi05_libero: normalized RMSE 0.079 / MAE 0.026** (12 frames × 10-step horizon). It's wired
-for LIBERO (its public LeRobot parquet carries ground-truth actions); DROID/ALOHA need their real
-episodes on disk. **Sim success-rate** (LIBERO + ALOHA closed-loop rollouts) requires the simulator
-stack (robosuite/bddl/mujoco, gym_aloha/dm_control) that openpi ships as **Dockerized** examples
-(`openpi/examples/{libero,aloha_sim}`); run those containers for success-rate — it is not installed in
-this conda env.
+Measured **pi05_libero: normalized RMSE 0.079 / MAE 0.026** (12 frames × 10-step horizon). It's wired for
+LIBERO (its public LeRobot parquet carries ground-truth actions); DROID/ALOHA need their real episodes.
+
+**2. Closed-loop sim success-rate** — rolls the policy out *in* the LIBERO simulator and reports task
+success. The model is served over openpi's websocket protocol (`serve_libero_torch.py` reuses openpi's
+real LIBERO transform pipeline — Normalize / LiberoInputs / Unnormalize / LiberoOutputs — straight off the
+torch checkpoint), and `eval_libero_sim.py` drives the sim client (same rollout loop as openpi's
+`examples/libero/main.py`). The sim stack (robosuite/bddl/mujoco) lives in a **separate py3.8 conda env**;
+rendering is headless via `MUJOCO_GL=egl` (no Docker, no X server):
+
+```bash
+# terminal 1 — policy server (main env, torch checkpoint, pick a GPU):
+CUDA_VISIBLE_DEVICES=1 python scripts/serve_libero_torch.py \
+    --checkpoint /scratch/.../pi05_libero_torch --config-name pi05_libero --port 8000
+# terminal 2 — LIBERO sim client (py3.8 libero-sim env, headless EGL):
+conda activate /scratch/ishirgarg/envs/libero-sim
+MUJOCO_GL=egl CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+LIBERO_CONFIG_PATH=/scratch/ishirgarg/libero_config PYTHONPATH=openpi/third_party/libero \
+python scripts/eval_libero_sim.py --task-suite-name libero_spatial \
+    --num-tasks 10 --num-trials-per-task 10 --no-save-video --out out/sim/pi05_libero
+```
+
+Measured **pi05_libero on libero_spatial: 100% (100/100, all 10 tasks × 10 trials)** — in line with the
+published pi05_libero numbers for this suite. DROID has no simulator; ALOHA sim (`gym_aloha`/`dm_control`)
+is not wired into the client yet.
 
 ## Outputs
 
