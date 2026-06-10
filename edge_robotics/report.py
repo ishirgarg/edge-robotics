@@ -177,6 +177,17 @@ def _render_kernel_analysis(ka: dict | None, order: tuple[str, ...], lines: list
                      + (f"  |  SM-coverage (CTAs vs {s.get('sm_count')} SMs, time-wtd)={smc:.2f}" if smc is not None else ""))
         lines.append(f"  launch-API CPU time={s.get('launch_api_cpu_ms_per_infer', 0):.2f}ms "
                      "(async-overlapped with GPU; off the critical path)")
+        tk = s.get("tiny_kernel_time_pct")
+        kd = (f"  kernel dist: p90={s.get('p90_kernel_us') or 0:.1f}us  max={s.get('max_kernel_us') or 0:.1f}us"
+              f"  |  idle-gap={s.get('idle_gap_ms_per_infer', 0):.2f}ms")
+        if tk is not None:
+            kd += f"  |  tiny(<5us)={100*s.get('tiny_kernel_frac', 0):.0f}% of kernels / {tk:.0f}% of GPU time"
+        lines.append(kd)
+        mc = s.get("memcpy_mib_per_infer")
+        if mc is not None:
+            lines.append(f"  data movement: memcpy={mc:.2f} MiB/infer (H2D {s.get('memcpy_h2d_mib_per_infer', 0):.2f},"
+                         f" D2H {s.get('memcpy_d2h_mib_per_infer', 0):.2f}, D2D {s.get('memcpy_d2d_mib_per_infer', 0):.2f})"
+                         f" + memset {s.get('memset_mib_per_infer', 0):.2f} MiB")
 
 
 def _render_roofline(rf: dict | None, order: tuple[str, ...], lines: list[str]) -> None:

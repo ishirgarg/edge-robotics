@@ -18,8 +18,9 @@ Outputs (all per-inference):
                          Answers attention-vs-W/A within backbone(vision+vlm) vs action.
   * gemm_split         — within gemm, compute-GEMM vs memory-bound GEMV (batch-1 decode), per phase.
   * system             — kernels/infer, graph vs eager launches, GPU-busy vs wall (utilization),
-                         launch-API CPU time, mean/median kernel duration, and an SM-coverage proxy
-                         (are there enough CTAs to cover the SMs?).
+                         launch-API CPU time, mean/median/p90/max kernel duration + tiny-kernel
+                         (<5us, launch-bound) share, GPU idle-gap time, an SM-coverage proxy, and
+                         data-movement volume (memcpy H2D/D2H/D2D + memset MiB/infer).
 Never raises: on any failure returns {"ok": False, "error": ...}.
 """
 
@@ -156,17 +157,34 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
                 smcov_num += min(blocks, sm_count) / sm_count * dur
                 smcov_den += dur
 
-            # --- Memcpy / memset: GPU memory ops, attributed to phases too (family memory_ops). ---
-            for table in ("CUPTI_ACTIVITY_KIND_MEMCPY", "CUPTI_ACTIVITY_KIND_MEMSET"):
-                try:
-                    rows = cur.execute(f"SELECT correlationId, start, end FROM {table}").fetchall()
-                except sqlite3.OperationalError:
-                    rows = []
-                for corr, st, en in rows:
-                    busy_intervals.append((st, en))
-                    p = phase_of(corr)
-                    if p is not None:
-                        per_phase_family[p]["memory_ops"] = per_phase_family[p].get("memory_ops", 0.0) + (en - st)
+            # --- Memcpy / memset: GPU memory ops, attributed to phases (family memory_ops) AND their
+            #     byte VOLUME by direction (H2D / D2H / D2D). Data movement is its own edge concern —
+            #     H2D/D2H is host<->device PCIe traffic per inference; D2D is the segmentation clones. ---
+            memcpy_bytes = {"h2d": 0, "d2h": 0, "d2d": 0, "other": 0}
+            memset_bytes = 0
+            _COPYKIND = {1: "h2d", 2: "d2h", 8: "d2d"}  # CUpti_ActivityMemcpyKind: 1=HtoD 2=DtoH 8=DtoD
+            try:
+                mc_rows = cur.execute(
+                    "SELECT correlationId, start, end, bytes, copyKind FROM CUPTI_ACTIVITY_KIND_MEMCPY").fetchall()
+            except sqlite3.OperationalError:
+                mc_rows = []
+            for corr, st, en, nbytes, ckind in mc_rows:
+                busy_intervals.append((st, en))
+                memcpy_bytes[_COPYKIND.get(ckind, "other")] += int(nbytes or 0)
+                p = phase_of(corr)
+                if p is not None:
+                    per_phase_family[p]["memory_ops"] = per_phase_family[p].get("memory_ops", 0.0) + (en - st)
+            try:
+                ms_rows = cur.execute(
+                    "SELECT correlationId, start, end, bytes FROM CUPTI_ACTIVITY_KIND_MEMSET").fetchall()
+            except sqlite3.OperationalError:
+                ms_rows = []
+            for corr, st, en, nbytes in ms_rows:
+                busy_intervals.append((st, en))
+                memset_bytes += int(nbytes or 0)
+                p = phase_of(corr)
+                if p is not None:
+                    per_phase_family[p]["memory_ops"] = per_phase_family[p].get("memory_ops", 0.0) + (en - st)
 
             # --- Launch / API counts + CPU time (async-overlapped; see note in `system` below). ---
             api = {strings.get(nid, str(nid)).split("_v")[0]: (cnt, dur) for nid, cnt, dur in cur.execute(
@@ -184,6 +202,12 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
             # split silently failed (NVTX/schema drift, or a backend with no phases) even though
             # kernels exist — without this signal an all-empty split looks identical to a good one.
             attributed_frac = (attributed_kernel_ns / total_kernel_ns) if total_kernel_ns else 0.0
+            # Kernel-granularity distribution — many tiny kernels = launch-bound (the decode regime).
+            _TINY_NS = 5000  # < 5 us
+            _durs = sorted(durations_ns)
+            p90_kernel_ns = _durs[min(len(_durs) - 1, int(0.9 * len(_durs)))] if _durs else 0
+            tiny_count = sum(1 for d in durations_ns if d < _TINY_NS)
+            tiny_time_ns = sum(d for d in durations_ns if d < _TINY_NS)
 
         def msinf(ns: float) -> float:
             return ns / 1e6 / n
@@ -211,6 +235,20 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
             # Coverage of the per-phase split: ~1.0 = every kernel attributed to a phase; near 0 =
             # the NVTX projection failed (don't trust per_phase_family/gemm_split then).
             "phase_attributed_frac": round(attributed_frac, 4),
+            # GPU bubble time: active span minus union-busy (idle gaps between/within GPU ops).
+            "idle_gap_ms_per_infer": msinf(max(wall_ns - gpu_busy_ns, 0)),
+            # Kernel-granularity distribution (tiny <5us kernels are launch-bound; complements
+            # mean/median above and the launch-overhead count — the decode regime is many tiny kernels).
+            "p90_kernel_us": (p90_kernel_ns / 1e3) if durations_ns else None,
+            "max_kernel_us": (max(durations_ns) / 1e3) if durations_ns else None,
+            "tiny_kernel_frac": round(tiny_count / n_kernels, 3) if n_kernels else None,
+            "tiny_kernel_time_pct": round(100.0 * tiny_time_ns / total_kernel_ns, 1) if total_kernel_ns else None,
+            # Data movement per inference: host<->device PCIe (H2D/D2H) + on-device copies (D2D).
+            "memcpy_mib_per_infer": sum(memcpy_bytes.values()) / 2**20 / n,
+            "memcpy_h2d_mib_per_infer": memcpy_bytes["h2d"] / 2**20 / n,
+            "memcpy_d2h_mib_per_infer": memcpy_bytes["d2h"] / 2**20 / n,
+            "memcpy_d2d_mib_per_infer": memcpy_bytes["d2d"] / 2**20 / n,
+            "memset_mib_per_infer": memset_bytes / 2**20 / n,
         }
         # Real wall-clock overhead: PRISTINE (non-nsys) wall minus GPU-busy. A small NEGATIVE value
         # is possible (CUPTI slightly inflates GPU-busy vs the un-profiled run) — reported signed, not
