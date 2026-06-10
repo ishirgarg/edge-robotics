@@ -269,7 +269,50 @@ aloha / base) the state IS folded into the prompt, so the study recovers that to
 separate **proprioception** bucket distinct from language (pi0 instead carries state as a continuous
 suffix token). Outputs:
 `attention.json` + four plots (by-modality bar, layer×modality heatmap, attention-vs-denoise-step,
-and a spatial overlay of action→base-camera attention on the real image).
+and a spatial overlay of action→base-camera attention on the real image). Measured proprioception
+separation on the real **pi05_droid** weights: vision 23% / language 23% / action-self 32% /
+**proprioception 21%** — the in-prompt state, previously lumped into "language," is now its own bucket.
+
+---
+
+## Multi-model matrix (pi0 / pi05 × DROID / ALOHA / LIBERO)
+
+`--config-name` is resolved via openpi `get_config`, so the openpi-torch backend profiles any
+pi0/pi05 × dataset config unchanged. Fetch + convert real checkpoints (each ~14 GB; `source env.sh`
+first so they land on `/scratch`):
+
+```bash
+source env.sh
+for cfg in pi05_libero pi05_droid pi0_droid pi0_aloha_sim; do
+  python scripts/get_pi0_torch.py --config-name $cfg --out /scratch/ishirgarg/openpi_cache/${cfg}_torch
+done
+# profiling matrix (latency + breakdown + roofline + system + bandwidth), real weights, native prompt:
+CONFIGS="pi05_libero pi05_droid pi0_droid pi0_aloha_sim" \
+  CKPT_pi05_libero=/scratch/ishirgarg/openpi_cache/pi05_libero_torch \
+  ... ./profile_sweep.sh   # pi0_* auto-skipped on the pi05-only realtime_vla backend
+```
+
+Camera/state layout per dataset (driven by openpi's `*Inputs`): LIBERO/DROID = base + 1 wrist (3rd
+cam masked), state 8; ALOHA = high + 2 wrists (all real), state 14. pi0 carries state as a continuous
+action-expert suffix token; pi05 either folds discretized state into the prompt (DROID/base) or omits
+it (LIBERO).
+
+## Evaluation (accuracy)
+
+```bash
+# offline action-prediction error: predicted chunk vs dataset ground-truth, normalized space:
+python scripts/eval_offline.py --checkpoint /scratch/.../pi05_libero_torch \
+    --config-name pi05_libero --gpu 0 --out out/eval/pi05_libero
+```
+
+Offline action-error runs the real inference path on sampled frames and compares the predicted action
+chunk to the dataset's ground-truth (normalized like training — quantile for pi05, z-score for pi0).
+Measured **pi05_libero: normalized RMSE 0.079 / MAE 0.026** (12 frames × 10-step horizon). It's wired
+for LIBERO (its public LeRobot parquet carries ground-truth actions); DROID/ALOHA need their real
+episodes on disk. **Sim success-rate** (LIBERO + ALOHA closed-loop rollouts) requires the simulator
+stack (robosuite/bddl/mujoco, gym_aloha/dm_control) that openpi ships as **Dockerized** examples
+(`openpi/examples/{libero,aloha_sim}`); run those containers for success-rate — it is not installed in
+this conda env.
 
 ## Outputs
 
