@@ -257,7 +257,11 @@ def analyze(*, checkpoint: str, config_name: str, gpu: int, num_steps: int, epis
                  "image_source": frame.get("image_source"), "prompt": frame["prompt"],
                  "episode": episode, "frame": frame_idx, "num_steps": num_steps, "prompt_len": eff_prompt_len,
                  "discrete_state_input": bool(cfg.discrete_state_input),
-                 "has_proprioception": layout["has_proprioception"], "layout": layout},
+                 # True for discrete-state pi05 (in-prompt) OR pi0 (continuous suffix state token).
+                 "has_proprioception": bool(layout["has_proprioception"] or suffix_state),
+                 "proprioception_kind": ("prompt_discrete" if layout["has_proprioception"]
+                                         else "suffix_state" if suffix_state else "none"),
+                 "layout": layout},
         "attention": buckets, "plots": plots,
     }
     os.makedirs(outdir, exist_ok=True)
