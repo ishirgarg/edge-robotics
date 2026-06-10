@@ -297,6 +297,21 @@ cam masked), state 8; ALOHA = high + 2 wrists (all real), state 14. pi0 carries 
 action-expert suffix token; pi05 either folds discretized state into the prompt (DROID/base) or omits
 it (LIBERO).
 
+### Matrix results (RTX A6000, real weights, max-autotune deployed path, native prompt)
+
+| config | headline (deployed) | breakdown vision/vlm/action | E2E vs roofline | server→edge KV/infer |
+|---|---|---|---|---|
+| pi05_libero | 89.6 ms / 11.2 Hz | 18% / 46% / 36% | 50% of ideal | 17.0 MiB (199 MB/s) |
+| pi05_droid  | 92.5 ms / 10.8 Hz | 17% / 44% / 39% | 49% of ideal | 17.0 MiB (193 MB/s) |
+| pi0_droid   | 75.8 ms / 13.2 Hz | 22% / 42% / 36% | 46% of ideal | 14.3 MiB (198 MB/s) |
+| pi0_aloha_sim | 81.3 ms / 12.3 Hz | 20% / 40% / 40% | 44% of ideal | 14.3 MiB (185 MB/s) |
+
+Takeaways: the **VLM prefill dominates** (40–46%), with the action expert close behind (36–40%); pi0
+configs are **faster than pi05** (75–81 vs 90–92 ms) because their shorter prompt (`max_token_len`
+48 vs 200) shrinks the prefill (and the KV transfer, 14.3 vs 17.0 MiB); every config sits at **~44–50%
+of its analytic roofline** — the same large headroom the single-config study found, concentrated in
+the memory-bound action expert. Headline is the native deployed (max-autotune) path for all.
+
 ## Evaluation (accuracy)
 
 ```bash
