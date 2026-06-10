@@ -339,7 +339,7 @@ def _run_parse(config: Config) -> None:
     if kernel_analysis and kernel_analysis.get("ok"):
         s = kernel_analysis["system"]
         frac = s.get("phase_attributed_frac")
-        if frac is not None and frac < 0.9:
+        if phases and frac is not None and frac < 0.9:
             print(f"[parse] WARNING: only {100*frac:.0f}% of kernel time attributed to NVTX phases — "
                   "the per-phase split may be unreliable (NVTX/schema drift or an opaque graph).")
         print(f"[parse] system: {s['kernels_per_infer']} kernels/infer via {s['graph_launches_per_infer']} graph "

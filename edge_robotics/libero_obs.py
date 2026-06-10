@@ -172,21 +172,22 @@ def _discrete_state_token_span(tok, prompt: str, state: np.ndarray, n_real: int)
     """Token sub-range [start, end) of the discretized state digits within the language block.
 
     Replicates PaligemmaTokenizer.tokenize's discrete-state format (openpi tokenizer.py:23-29), then
-    recovers the span by BYTE OFFSETS, not length-differencing. Length-differencing is off-by-one
+    recovers the span by CHARACTER OFFSETS (SentencePiece piece .begin/.end are char offsets in the
+    normalized text — verified empirically), not length-differencing. Length-differencing is off-by-one
     when the first state digit is "-1" (state[0] < -1): SentencePiece merges the trailing space of
     "State: " with the "-" into one `▁-` piece, so the standalone space piece that `encode(head)`
-    counts vanishes in the full encoding. Byte-overlap instead assigns the merged piece to the state
-    (its byte span crosses the state boundary), which is correct. Clamped to n_real for truncation."""
+    counts vanishes in the full encoding. Offset-overlap instead assigns the merged piece to the state
+    (its span crosses the state boundary), which is correct. Clamped to n_real for truncation."""
     cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
     disc = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
     state_str = " ".join(map(str, disc))
     full = f"Task: {cleaned}, State: {state_str};\nAction: "
     head = f"Task: {cleaned}, State: "
-    b0 = len(head.encode("utf-8"))                      # byte where the state digits begin
-    b1 = b0 + len(state_str.encode("utf-8"))            # byte where they end (before ";")
+    c0 = len(head)                                      # char index where the state digits begin
+    c1 = c0 + len(state_str)                            # char index where they end (before ";")
     sp = tok._tokenizer  # noqa: SLF001 — the SentencePiece processor PaligemmaTokenizer wraps
-    pieces = sp.EncodeAsImmutableProto(full).pieces     # each piece carries byte .begin/.end (no BOS)
-    start = next((i for i, p in enumerate(pieces) if p.end > b0), len(pieces))
-    end = next((i for i, p in enumerate(pieces) if p.begin >= b1), len(pieces))
+    pieces = sp.EncodeAsImmutableProto(full).pieces     # each piece carries char .begin/.end (no BOS)
+    start = next((i for i, p in enumerate(pieces) if p.end > c0), len(pieces))
+    end = next((i for i, p in enumerate(pieces) if p.begin >= c1), len(pieces))
     start, end = start + 1, end + 1                     # tokens are encoded with add_bos=True (+1)
     return min(start, n_real), min(end, n_real)         # clamp into the real (non-pad) token range

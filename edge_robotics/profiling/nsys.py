@@ -131,7 +131,11 @@ def parse_nvtx_gpu_proj(rep_path: str, *, iters: int, phases: tuple[str, ...]) -
     """Per-phase GPU device time (ms/infer) from the NVTX GPU Projection Summary.
 
     Returns parse_trace-shaped dict: phases_ms_per_infer, total_gpu_ms_per_infer, attributed_frac.
-    `attributed_frac` = sum(phase proj) / total GPU kernel time (cross-check vs kernel-sum total).
+    `attributed_frac` = Σ(phase projection) / total GPU op time — a COVERAGE cross-check. NOTE: each
+    phase's "Total Proj Time" is a per-range SPAN (first-op-start to last-op-end, so it includes
+    intra-range idle gaps), while the denominator is a SUM of op durations (kernels + memcpy/memset),
+    so this can slightly EXCEED 1.0 (~3-5% on real captures). For the exact kernels-only attributed
+    fraction (≤1 by construction), use kernel_analysis.system.phase_attributed_frac.
     """
     try:
         rows = _run_stats_csv(rep_path, "nvtx_gpu_proj_sum")

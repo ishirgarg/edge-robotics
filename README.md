@@ -83,9 +83,10 @@ single-compile path — so segmenting buys an attributable breakdown at no measu
   glue: noise sampling, the `x_t+dt·v_t` update, D2D copies) are reported, not hidden.
 - **Per-component standalone** — each phase timed in isolation, fully optimized (graphs on), with the
   upstream inputs precomputed once and reused.
-- **Kernel-family buckets** (`pi05_realtimevla`, and also available for openpi-torch) — every GPU
-  kernel classified by name into attention / gemm / conv / elementwise / other. Graph-safe (nsys
-  reports real kernel names even inside graphs). Heuristic — always sanity-check the `other` bucket.
+- **Kernel-family buckets** (`realtime_vla`, and also available for openpi-torch) — every GPU
+  kernel classified by name into attention / gemm / conv / quantize / elementwise / other (the
+  `quantize` family + int8/fp8 GEMM keys cover quantized backends). Graph-safe (nsys reports real
+  kernel names even inside graphs). Heuristic — always sanity-check the `other` bucket.
 
 ### The four stages (one nsys capture, clean wall numbers)
 
