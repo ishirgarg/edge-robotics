@@ -17,9 +17,6 @@ For each run it reports:
   Answers "attention vs W/A, backbone vs action part."
 - **System & overhead** — kernels/infer, CUDA-graph vs eager launches, GPU-busy-vs-wall utilization,
   launch-API overhead, SM-coverage. Answers "CUDA launch overheads, utilization."
-- **Roofline** — analytic ideal lower bound (`max(FLOPs/peak, Bytes/BW)` per operator, after
-  [NVlabs/vla-perf](https://github.com/NVlabs/vla-perf)) with arithmetic intensity, compute-vs-memory
-  bound, and **how far from ideal** we are (MFU/MBU, efficiency). Answers "compare with roofline."
 - **Server↔edge transfer** — per-inference bytes the action expert conditions on (the VLM's prefix
   KV cache + masks + state) if the VLM ran on a server and the action expert on the edge. Answers
   "how much network bandwidth for a VLM-on-server / VLA-on-edge split." (`edge_robotics/bandwidth.py`)
@@ -29,7 +26,7 @@ For each run it reports:
 
 The framework is config-driven: `--config-name` is resolved via openpi `get_config`, so any
 **pi0/pi05 × DROID/ALOHA/LIBERO** config works on the openpi-torch backend with no new code, and the
-roofline is **quantization-aware** (a `QuantScheme` for int8/fp8/int4 variants). Two backends
+transfer sizing is **quantization-aware** (a `QuantScheme` for int8/fp8/int4 variants). Two backends
 (pick with `--system`):
 
 | `--system` | what | component attribution |
@@ -107,10 +104,10 @@ the python brackets), so model load, compile, cudagraph capture and warmup are e
 
 ---
 
-## Bottleneck, overhead & roofline analysis
+## Bottleneck & overhead analysis
 
 The same single nsys capture (parsed from its `.sqlite`, `edge_robotics/profiling/kernel_analysis.py`)
-and an analytic model (`edge_robotics/roofline.py`) answer three questions beyond the phase split:
+answers two questions beyond the phase split:
 
 **1. Attention vs weights/activations, backbone vs action.** Every GPU kernel is attributed to its
 phase (vision/vlm/action) AND its family (attention / gemm / elementwise / memory-ops) by the
@@ -127,29 +124,7 @@ launches, GPU-busy/wall utilization (~96%), launch-API CPU time (async-overlappe
 path), mean/median kernel duration, and a time-weighted SM-coverage proxy (~0.87 — the tiny decode
 kernels don't fill all 84 SMs).
 
-**3. Roofline — how far from ideal.** Per operator `T = max(FLOPs/peak_compute, Bytes/peak_BW)`
-(after [NVlabs/vla-perf](https://github.com/NVlabs/vla-perf)), summed per phase, vs the A6000's
-154.8 dense-bf16 TFLOPS / 768 GB/s (ridge ≈ 202 FLOP/byte). pi-0.5 on A6000:
-
-| phase  | OI (FLOP/byte) | bound        | ideal ms | measured GPU ms | efficiency (MFU/MBU) |
-|--------|----------------|--------------|----------|------------------|----------------------|
-| vision | ~322           | **compute**  | ~4.6     | ~15.0            | 31% (MFU 28%)        |
-| vlm    | ~530           | **compute**  | ~22.3    | ~32.9            | 68% (MFU 67%)        |
-| action | ~7             | **memory**   | ~14.5    | ~35.3 (openpi)   | 41% (MBU 41%)        |
-
-The VLM prefill is the best-utilised (67% MFU). The **action expert is memory-bound** (tiny OI: 10
-query tokens re-reading all expert weights + the fp32 adaRMS modulation weights every denoise step) —
-and is where the headroom is: openpi-torch hits 41% of its memory roofline, while **realtime-vla's
-fused Triton kernels hit ~93%** of the same roofline (15.5 ms vs 35.3 ms) — the clearest concrete
-optimization signal in the study. End-to-end, the measured wall is ~50% of the analytic ideal.
-
-> Roofline hardware is auto-detected (A6000; unknown GPUs warn before defaulting); override for other
-> targets with `EDGE_ROBOTICS_PEAK_BF16_TFLOPS` / `EDGE_ROBOTICS_MEM_BW_GBPS` (e.g. to model a Jetson).
-> The roofline is **quantization-aware**: a `QuantScheme` (weights/activations/kv/compute dtype, read
-> from the run's meta) rescales the bytes and selects the int8/fp8/int4 tensor-core peak; bf16 (the
-> default) is byte-identical to the dense model.
-
-**4. Server↔edge transfer (`edge_robotics/bandwidth.py`).** If the heavy VLM ran on a server and only
+**3. Server↔edge transfer (`edge_robotics/bandwidth.py`).** If the heavy VLM ran on a server and only
 the action expert on the edge robot, the per-inference data crossing the network is what the expert
 **conditions on** — dominated by the VLM's prefix **KV cache** (gemma_2b prefill: depth × {K,V} ×
 prefix_len × kv_heads(MQA=1) × head_dim) plus the pad mask and (pi0) state. For pi05_libero that's
@@ -241,8 +216,8 @@ study** (random weights give meaningless attention). Fetch + convert the public 
 
 ```bash
 source env.sh
-python scripts/get_pi05_libero_torch.py        # downloads gs://openpi-assets/checkpoints/pi05_libero
-                                                # (anon gcsfs, ~12GB) + converts JAX->torch safetensors
+python scripts/get_pi0_torch.py --config-name pi05_libero   # downloads gs://openpi-assets/checkpoints/pi05_libero
+                                                            # (anon gcsfs, ~12GB) + converts JAX->torch safetensors
 ```
 
 Then profile the real weights (identical latency, now a faithful artifact), or run the attention study:
@@ -286,7 +261,7 @@ source env.sh
 for cfg in pi05_libero pi05_droid pi0_droid pi0_aloha_sim; do
   python scripts/get_pi0_torch.py --config-name $cfg --out /scratch/ishirgarg/openpi_cache/${cfg}_torch
 done
-# profiling matrix (latency + breakdown + roofline + system + bandwidth), real weights, native prompt:
+# profiling matrix (latency + breakdown + system + bandwidth), real weights, native prompt:
 CONFIGS="pi05_libero pi05_droid pi0_droid pi0_aloha_sim" \
   CKPT_pi05_libero=/scratch/ishirgarg/openpi_cache/pi05_libero_torch \
   ... ./profile_sweep.sh   # pi0_* auto-skipped on the pi05-only realtime_vla backend
@@ -299,18 +274,17 @@ it (LIBERO).
 
 ### Matrix results (RTX A6000, real weights, max-autotune deployed path, native prompt)
 
-| config | headline (deployed) | breakdown vision/vlm/action | E2E vs roofline | server→edge KV/infer |
-|---|---|---|---|---|
-| pi05_libero | 89.6 ms / 11.2 Hz | 18% / 46% / 36% | 50% of ideal | 17.0 MiB (199 MB/s) |
-| pi05_droid  | 92.5 ms / 10.8 Hz | 17% / 44% / 39% | 49% of ideal | 17.0 MiB (193 MB/s) |
-| pi0_droid   | 75.8 ms / 13.2 Hz | 22% / 42% / 36% | 46% of ideal | 14.3 MiB (198 MB/s) |
-| pi0_aloha_sim | 81.3 ms / 12.3 Hz | 20% / 40% / 40% | 44% of ideal | 14.3 MiB (185 MB/s) |
+| config | headline (deployed) | breakdown vision/vlm/action | server→edge KV/infer |
+|---|---|---|---|
+| pi05_libero | 89.6 ms / 11.2 Hz | 18% / 46% / 36% | 17.0 MiB (199 MB/s) |
+| pi05_droid  | 92.5 ms / 10.8 Hz | 17% / 44% / 39% | 17.0 MiB (193 MB/s) |
+| pi0_droid   | 75.8 ms / 13.2 Hz | 22% / 42% / 36% | 14.3 MiB (198 MB/s) |
+| pi0_aloha_sim | 81.3 ms / 12.3 Hz | 20% / 40% / 40% | 14.3 MiB (185 MB/s) |
 
 Takeaways: the **VLM prefill dominates** (40–46%), with the action expert close behind (36–40%); pi0
 configs are **faster than pi05** (75–81 vs 90–92 ms) because their shorter prompt (`max_token_len`
-48 vs 200) shrinks the prefill (and the KV transfer, 14.3 vs 17.0 MiB); every config sits at **~44–50%
-of its analytic roofline** — the same large headroom the single-config study found, concentrated in
-the memory-bound action expert. Headline is the native deployed (max-autotune) path for all.
+48 vs 200) shrinks the prefill (and the KV transfer, 14.3 vs 17.0 MiB). Headline is the native
+deployed (max-autotune) path for all.
 
 ## Evaluation (accuracy)
 
@@ -362,7 +336,7 @@ is not wired into the client yet.
 - `<out>/profile.json`: `meta` (= the manifest above) + `result` (E2E stats mean/median/p50/p90/p99,
   segmentation overhead, NVTX per-phase ms/%, kernel buckets + top kernels, per-component standalone ms,
   and the deep analysis: `kernel_analysis` (per-phase×family, gemm/gemv split, `system` overhead/util)
-  and `roofline` (per-phase OI/bound/ideal-ms + measured MFU/MBU/efficiency)).
+  and `bandwidth` (server→edge KV-cache + conditioning transfer sizing)).
 - `<out>/profile.csv`: long format — one row per `(metric, phase)` for plotting across a sweep.
 - `<out>/profile.nsys-rep`: the raw nsys capture; open in the Nsight Systems GUI for the full timeline.
 - `<out>/profile.{timing,breakdown}.json`: the intermediate per-stage artifacts.
@@ -384,7 +358,7 @@ is not wired into the client yet.
   (persisted into meta and read back by the offline `parse`/`report` stages) — there is no phase table to edit.
 - The profiling primitives (`profiling/{walltime,nsys}.py`) are system-agnostic and reusable.
 - **Deep analysis** is system-agnostic too: `profiling/kernel_analysis.py` (per-phase×family + system
-  overhead from the nsys SQLite) and `roofline.py` (analytic lower bound from model dims + hardware
-  peaks) work for any system whose meta carries the model dims and which emits NVTX phases.
+  overhead from the nsys SQLite) and `bandwidth.py` (server→edge transfer sizing from model dims)
+  work for any system whose meta carries the model dims and which emits NVTX phases.
 - **Attention study**: `attention.py` (eager capture + modality bucketing + plots) and `libero_obs.py`
   (real LIBERO frame → model `Observation` + token layout), driven by `scripts/attention_heatmaps.py`.

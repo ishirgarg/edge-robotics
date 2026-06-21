@@ -115,6 +115,9 @@ def _environment_meta(config: Config) -> dict:
         except Exception:  # noqa: BLE001
             return None
 
+    def _first_line(s):
+        return s.splitlines()[0].strip() if s else None
+
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     git_commit = _sh(["git", "-C", repo, "rev-parse", "HEAD"])
     git_dirty = bool(_sh(["git", "-C", repo, "status", "--porcelain"]))
@@ -135,17 +138,12 @@ def _environment_meta(config: Config) -> dict:
             driver_api = torch._C._cuda_getDriverVersion()  # noqa: SLF001  (e.g. 12060)
         except Exception:  # noqa: BLE001
             driver_api = None
-    nvidia_driver = _sh(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"])
-    if nvidia_driver:
-        nvidia_driver = nvidia_driver.splitlines()[0].strip()
+    nvidia_driver = _first_line(_sh(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]))
 
     from .profiling.nsys import nsys_bin
 
     nsys_path = nsys_bin()
-    nsys_ver = None
-    if nsys_path:
-        v = _sh([nsys_path, "--version"])
-        nsys_ver = v.splitlines()[0].strip() if v else None
+    nsys_ver = _first_line(_sh([nsys_path, "--version"])) if nsys_path else None
 
     return {
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -256,8 +254,7 @@ def _run_time(config: Config) -> None:
     }
     path = f"{config.output}.timing.json"
     _write_json(path, payload)
-    sm = sorted(seg)[len(seg) // 2]
-    print(f"[time] segmented median ~{sm:.2f} ms -> wrote {path}")
+    print(f"[time] segmented median ~{_median(seg):.2f} ms -> wrote {path}")
 
 
 def _run_time_native(config: Config) -> None:
@@ -277,8 +274,7 @@ def _run_time_native(config: Config) -> None:
     print(f"[time-native] timing native single-compile E2E (warmup={nat_warmup})...")
     nat = time_callable(loaded.infer_native, loaded.block, warmup=nat_warmup, iters=config.iters)
     _write_json(f"{config.output}.timing-native.json", {"e2e_native_ms": nat})
-    nm = sorted(nat)[len(nat) // 2]
-    print(f"[time-native] native median ~{nm:.2f} ms")
+    print(f"[time-native] native median ~{_median(nat):.2f} ms")
 
 
 def _run_nsys(config: Config) -> None:
@@ -317,7 +313,7 @@ def _run_parse(config: Config) -> None:
     buckets = parse_kernel_buckets(rep, iters=config.iters)
 
     seg = timing.get("e2e_segmented_ms")
-    pristine = sorted(seg)[len(seg) // 2] if seg else None
+    pristine = _median(seg)
     sm = (((tmeta.get("environment") or {}).get("hardware") or {}).get("device") or {}).get(
         "multi_processor_count")
     kernel_analysis = analyze_sqlite(
@@ -357,39 +353,12 @@ def _run_report(config: Config) -> None:
     from .metrics import build_result
     from .report import render_summary, write_outputs
 
-    from . import roofline as _roofline
-
     timing = _read_json(f"{config.output}.timing.json") or {}
     native = _read_json(f"{config.output}.timing-native.json") or {}
     breakdown = _read_json(f"{config.output}.breakdown.json") or {}
     meta = timing.get("meta") or {"system": config.system, "config_name": config.config_name,
                                   "prompt_len": config.prompt_len, "num_steps": config.num_steps,
                                   "batch_size": config.batch_size, "iters": config.iters}
-
-    # Roofline: ideal lower bound from model dims + hardware peaks, merged with the MEASURED per-phase
-    # GPU time (nsys NVTX projection) and the pristine E2E wall -> MFU/MBU and how-far-from-ideal.
-    bd_nvtx = breakdown.get("breakdown_nvtx") or {}
-    phases_gpu_ms = bd_nvtx.get("phases_ms_per_infer") if bd_nvtx.get("ok") else None
-    # Roofline-vs-wall uses the DEPLOYED (native, headline) wall; per-phase GPU times come from the
-    # segmented nsys capture. Fall back to the segmented wall if the native cross-check wasn't run.
-    def _median(xs):
-        return sorted(xs)[len(xs) // 2] if xs else None
-
-    e2e_wall = _median(native.get("e2e_native_ms")) or _median(timing.get("e2e_segmented_ms"))
-    try:
-        roofline = _roofline.analyze(meta, phases_gpu_ms=phases_gpu_ms, e2e_wall_ms=e2e_wall)
-    except Exception as exc:  # noqa: BLE001  — roofline is supplementary; never gate the core report
-        print(f"[report] WARNING: roofline computation failed ({exc}); omitting.")
-        roofline = None
-
-    # Server<->edge transfer sizing: per-inference bytes the action expert conditions on (prefix KV
-    # cache + masks + state) if the VLM ran on a server. Rate uses the deployed (headline) freq.
-    from . import bandwidth as _bandwidth
-    try:
-        bandwidth = _bandwidth.analyze(meta, freq_hz=(1000.0 / e2e_wall if e2e_wall else None))
-    except Exception as exc:  # noqa: BLE001
-        print(f"[report] WARNING: bandwidth sizing failed ({exc}); omitting.")
-        bandwidth = None
 
     result = build_result(
         e2e_segmented=timing.get("e2e_segmented_ms"),
@@ -398,9 +367,17 @@ def _run_report(config: Config) -> None:
         kernel_buckets=breakdown.get("kernel_buckets"),
         components_standalone=timing.get("components_standalone"),
         kernel_analysis=breakdown.get("kernel_analysis"),
-        roofline=roofline,
-        bandwidth=bandwidth,
     )
+
+    # Server<->edge transfer sizing: per-inference bytes the action expert conditions on (prefix KV
+    # cache + masks + state) if the VLM ran on a server. Rate uses the SAME deployed (headline) freq
+    # the result reports (metrics.build_result picks native-then-segmented via np.median).
+    from . import bandwidth as _bandwidth
+    try:
+        result["bandwidth"] = _bandwidth.analyze(meta, freq_hz=result.get("freq_hz"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[report] WARNING: bandwidth sizing failed ({exc}); omitting.")
+
     print("\n" + render_summary(meta, result))
     json_path, csv_path = write_outputs(config.output, meta, result)
 
@@ -431,6 +408,12 @@ def _read_json(path: str) -> dict | None:
         return None
     with open(path) as f:
         return json.load(f)
+
+
+def _median(xs: list[float] | None) -> float | None:
+    """Upper-middle sample (a quick, numpy-free median for the light parse/report path; the headline
+    freq in metrics.stats uses np.median instead)."""
+    return sorted(xs)[len(xs) // 2] if xs else None
 
 
 def main() -> None:

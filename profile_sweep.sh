@@ -30,7 +30,7 @@ export WARMUP="${WARMUP:-3}"
 export ITERS="${ITERS:-20}"
 export BATCH_SIZE="${BATCH_SIZE:-1}"
 # BOTH compile paths default to max-autotune = openpi's deployed mode (max fidelity). The headline is
-# the native E2E; the segmented breakdown is captured at the same mode so the roofline reflects the
+# the native E2E; the segmented breakdown is captured at the same mode so the breakdown reflects the
 # deployed kernels. Override to reduce-overhead only for fast iteration (degrades breakdown fidelity).
 export OPENPI_TORCH_COMPILE_MODE="${OPENPI_TORCH_COMPILE_MODE:-max-autotune}"
 export OPENPI_TORCH_NATIVE_COMPILE_MODE="${OPENPI_TORCH_NATIVE_COMPILE_MODE:-max-autotune}"

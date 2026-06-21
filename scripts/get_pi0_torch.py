@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Fetch a real pi0/pi05 checkpoint and convert it to PyTorch safetensors (ANY registered config).
 
-Generalizes get_pi05_libero_torch.py: maps a config name to its public checkpoint at
+Maps a config name to its public checkpoint at
 `gs://openpi-assets/checkpoints/<config_name>` (override with --gs), downloads via anonymous gcsfs,
 runs openpi's `convert_jax_model_to_pytorch.py` (config-driven, so it works for every pi0/pi05 ×
 dataset config), and copies norm_stats. The converted dir loads via `--checkpoint <dir>` on the

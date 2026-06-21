@@ -24,7 +24,7 @@ degrades to kernel-family buckets only. (Both current backends DO split into vis
 realtime-vla achieves it by re-capturing its fused graph as three per-stage sub-graphs.)
 `block(out)` forces device completion for honest wall timing.
 
-`meta` is the carrier for everything the offline stages and the roofline need without re-loading
+`meta` is the carrier for everything the offline stages need without re-loading
 the model: dims (action_horizon/action_dim/max_token_len/n_images/paligemma_variant/...), the model
 family axes (`pi05`, `discrete_state_input`, `proprioception` in {suffix_state, prompt_discrete,
 none}), the precision/quant axis (`compute_dtype`), and the compile modes.

@@ -145,8 +145,6 @@ class RealtimeVlaSystem(ProfiledSystem):
             ckpt_resolved = str(checkpoint)
             print("[realtime_vla] NOTE: real-weights path is experimental/unvalidated.")
 
-        images_in, noise_in = fwd_args[0], fwd_args[1]
-
         # The eager input-copy from Pi05Inference.forward (lines 811-824), factored out so the
         # captured sub-graphs only contain the *compute*, exactly like the repo's single graph (whose
         # input copies are also eager, before replay). prompt_embeds/decoder_rope depend only on the
@@ -166,8 +164,8 @@ class RealtimeVlaSystem(ProfiledSystem):
             b["encoder_x"][_start : _start + prompt_len_actual].copy_(prompt_embeds)
             b["valid_encoder_len"].fill_(_start + prompt_len_actual)
             b["decoder_rope_weights"].copy_(_decoder_rope)
-            b["observation_images_normalized"].copy_(images_in)
-            b["diffusion_noise"].copy_(noise_in)  # decoder overwrites this in place; re-seed each run
+            b["observation_images_normalized"].copy_(images)
+            b["diffusion_noise"].copy_(noise)  # decoder overwrites this in place; re-seed each run
 
         # Re-capture the model as three per-stage sub-graphs sharing one capture pool. Warm the full
         # pipeline first so every Triton kernel is JIT-compiled/autotuned (capture forbids that).
@@ -177,7 +175,7 @@ class RealtimeVlaSystem(ProfiledSystem):
 
         def _capture(fn, pool=None):
             g = torch.cuda.CUDAGraph()
-            with (torch.cuda.graph(g, pool=pool) if pool is not None else torch.cuda.graph(g)):
+            with torch.cuda.graph(g, pool=pool):
                 fn()
             return g
 
@@ -216,7 +214,7 @@ class RealtimeVlaSystem(ProfiledSystem):
         def block(_out):
             torch.cuda.synchronize()
 
-        def component_profiler(*, warmup: int, iters: int, logdir: str | None = None) -> dict:
+        def component_profiler(*, warmup: int, iters: int) -> dict:
             """Time each stage sub-graph standalone (graphs ON). Buffers persist across replays, so a
             stage can be replayed in isolation once the pipeline has been primed."""
             n = max(int(iters), 1)

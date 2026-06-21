@@ -102,6 +102,14 @@ def _proprioception_kind(cfg) -> str:
     return "prompt_discrete" if cfg.discrete_state_input else "none"
 
 
+def _graphs_enabled(mode: str) -> bool:
+    return mode.lower() not in ("", "none", "off", "eager")
+
+
+def _clone_kv(kc, vc):
+    return tuple(t.clone() for t in kc), tuple(t.clone() for t in vc)
+
+
 class OpenpiTorchSystem(ProfiledSystem):
     def load(
         self,
@@ -126,24 +134,24 @@ class OpenpiTorchSystem(ProfiledSystem):
         # latency studies). Otherwise a path to a converted torch checkpoint (a dir with
         # model.safetensors, or the .safetensors itself) — needed for VALUE-dependent analyses like
         # attention heatmaps, and for a faithful "real deployed weights" profiling run. Latency is
-        # identical either way; only the weight VALUES differ. See scripts/get_pi05_libero_torch.py.
+        # identical either way; only the weight VALUES differ. See scripts/get_pi0_torch.py.
         real_ckpt = None
         if checkpoint != "random":
             real_ckpt = checkpoint if checkpoint.endswith(".safetensors") else os.path.join(checkpoint, "model.safetensors")
             if not os.path.exists(real_ckpt):
                 raise FileNotFoundError(f"checkpoint not found: {real_ckpt} (expected a converted torch "
-                                        "checkpoint; run scripts/get_pi05_libero_torch.py)")
+                                        "checkpoint; run scripts/get_pi0_torch.py --config-name <cfg>)")
 
         # Two compile modes, BOTH default to max-autotune — openpi's OWN Pi0Config default and the
         # mode it actually deploys — for maximum fidelity (the user's hard constraint). The native
         # path is the faithful headline; the segmented per-phase graphs are the breakdown vehicle and
-        # are compiled at the SAME mode so the per-phase kernels (and the roofline efficiency drawn
-        # from them) are the deployed kernels, and seg-vs-native is a clean segmentation-overhead
-        # measure. Override OPENPI_TORCH_COMPILE_MODE=reduce-overhead only for fast iteration.
+        # are compiled at the SAME mode so the per-phase kernels are the deployed kernels, and
+        # seg-vs-native is a clean segmentation-overhead measure. Override
+        # OPENPI_TORCH_COMPILE_MODE=reduce-overhead only for fast iteration.
         compile_mode = os.environ.get("OPENPI_TORCH_COMPILE_MODE", "max-autotune")
         native_mode = os.environ.get("OPENPI_TORCH_NATIVE_COMPILE_MODE", "max-autotune")
-        graphs_on = compile_mode.lower() not in ("", "none", "off", "eager")
-        native_graphs = native_mode.lower() not in ("", "none", "off", "eager")
+        graphs_on = _graphs_enabled(compile_mode)
+        native_graphs = _graphs_enabled(native_mode)
 
         # Build the model with NO openpi-side compile — we compile per-phase ourselves (segmented)
         # and separately wrap sample_actions for the native cross-check. Config DERIVED from openpi.
@@ -232,6 +240,18 @@ class OpenpiTorchSystem(ProfiledSystem):
 
         dt_val = -1.0 / num_steps
 
+        def _denoise_loop(st, ppm, kc, vc, x_t):
+            # Flow-matching integration loop, exactly as it runs in E2E. Defined once and shared by the
+            # segmented headline path and the standalone component profiler so the two cannot drift.
+            dt = torch.tensor(dt_val, dtype=torch.float32, device=device)
+            t = torch.tensor(1.0, dtype=torch.float32, device=device)
+            for _ in range(num_steps):
+                _mark()
+                v_t = denoise_fn(st, ppm, kc, vc, x_t, t.expand(batch_size)).clone()
+                x_t = x_t + dt * v_t
+                t = t + dt
+            return x_t
+
         @torch.inference_mode()
         def infer_segmented(noise=None):
             """Per-phase-graph E2E with NVTX ranges (headline wall + nsys split vehicle)."""
@@ -244,17 +264,9 @@ class OpenpiTorchSystem(ProfiledSystem):
             _mark()
             with nvtx_range("vlm"):
                 kc, vc = vlm_fn(pe, ppm, pam)
-                kc = tuple(t.clone() for t in kc)
-                vc = tuple(t.clone() for t in vc)
+                kc, vc = _clone_kv(kc, vc)
             with nvtx_range("action"):
-                dt = torch.tensor(dt_val, dtype=torch.float32, device=device)
-                x_t = noise
-                tt = torch.tensor(1.0, dtype=torch.float32, device=device)
-                for _ in range(num_steps):
-                    _mark()
-                    v_t = denoise_fn(st, ppm, kc, vc, x_t, tt.expand(batch_size)).clone()
-                    x_t = x_t + dt * v_t
-                    tt = tt + dt
+                x_t = _denoise_loop(st, ppm, kc, vc, noise)
             return x_t
 
         # Native cross-check: openpi's OWN single torch.compile(sample_actions) fast path, compiled
@@ -272,7 +284,7 @@ class OpenpiTorchSystem(ProfiledSystem):
         def block(_out):
             torch.cuda.synchronize()
 
-        def component_profiler(*, warmup: int, iters: int, logdir: str | None = None) -> dict:
+        def component_profiler(*, warmup: int, iters: int) -> dict:
             """Time each component standalone in its graphs-on form (ms/infer). Upstream inputs are
             computed once and reused so each phase is timed in isolation."""
             n = max(int(iters), 1)
@@ -285,8 +297,7 @@ class OpenpiTorchSystem(ProfiledSystem):
                 for _ in range(max(warmup, 1)):
                     _mark()
                     kc, vc = vlm_fn(pe, ppm, pam)
-                kc = tuple(t.clone() for t in kc)
-                vc = tuple(t.clone() for t in vc)
+                kc, vc = _clone_kv(kc, vc)
                 noise = model.sample_noise((batch_size, cfg.action_horizon, cfg.action_dim), device)
                 tt = torch.ones(batch_size, dtype=torch.float32, device=device)
                 for _ in range(max(warmup, 1)):
@@ -311,14 +322,7 @@ class OpenpiTorchSystem(ProfiledSystem):
 
                 def _action_call():
                     # Full denoise loop, the way it runs in E2E.
-                    dt = torch.tensor(dt_val, dtype=torch.float32, device=device)
-                    x_t = noise
-                    t_ = torch.tensor(1.0, dtype=torch.float32, device=device)
-                    for _ in range(num_steps):
-                        _mark()
-                        v_t = denoise_fn(st, ppm, kc, vc, x_t, t_.expand(batch_size)).clone()
-                        x_t = x_t + dt * v_t
-                        t_ = t_ + dt
+                    _denoise_loop(st, ppm, kc, vc, noise)
 
                 per = {"vision": _time(_vision_call), "vlm": _time(_vlm_call), "action": _time(_action_call)}
 
@@ -364,8 +368,8 @@ class OpenpiTorchSystem(ProfiledSystem):
             "discrete_state_input": bool(cfg.discrete_state_input),
             "proprioception": _proprioception_kind(cfg),
             "dtype": cfg.dtype,
-            # Matmul/quantization axis (bf16 today; the roofline reads this). The real model is
-            # deliberately MIXED (bf16 weights, fp32 embeddings/norms/projections) — this names the
+            # Matmul/quantization axis (bf16 today; the bandwidth sizing reads this). The real model
+            # is deliberately MIXED (bf16 weights, fp32 embeddings/norms/projections) — this names the
             # dominant matmul precision, not a uniform cast.
             "compute_dtype": cfg.dtype,
             "compile_mode": compile_mode if graphs_on else "eager",

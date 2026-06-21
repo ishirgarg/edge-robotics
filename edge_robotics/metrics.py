@@ -28,7 +28,6 @@ def stats(samples_ms: list[float]) -> dict:
     return {
         "mean": float(a.mean()),
         "median": float(np.median(a)),
-        "p50": float(np.percentile(a, 50)),
         "p90": float(np.percentile(a, 90)),
         "p99": float(np.percentile(a, 99)),
         "std": float(a.std()),
@@ -45,6 +44,16 @@ def _pct_split(phases_ms: dict) -> dict:
     return {k: 100.0 * v / total for k, v in phases_ms.items()}
 
 
+def _attach(res: dict, key: str, src: dict | None, build) -> None:
+    """Attach res[key]=build(src) when src succeeded, else res[key+'_error'], else nothing."""
+    if src is None:
+        return
+    if src.get("ok"):
+        res[key] = build(src)
+    else:
+        res[f"{key}_error"] = src.get("error")
+
+
 def build_result(
     *,
     e2e_segmented: list[float] | None,
@@ -53,8 +62,6 @@ def build_result(
     kernel_buckets: dict | None,
     components_standalone: dict | None,
     kernel_analysis: dict | None = None,
-    roofline: dict | None = None,
-    bandwidth: dict | None = None,
 ) -> dict:
     """Combine whatever measurements are present into one JSON-serializable result dict."""
     res: dict = {}
@@ -76,57 +83,37 @@ def build_result(
     if seg_med and nat_med:
         res["segmentation_overhead_pct"] = 100.0 * (seg_med / nat_med - 1.0)
 
-    if breakdown_nvtx is not None and breakdown_nvtx.get("ok"):
-        p = breakdown_nvtx["phases_ms_per_infer"]
-        res["breakdown_nvtx"] = {
-            "phases_ms_per_infer": p,
-            "phases_pct": _pct_split(p),
-            "attributed_frac": breakdown_nvtx.get("attributed_frac"),
-            "residual_ms_per_infer": breakdown_nvtx.get("residual_ms_per_infer"),
-            "total_gpu_ms_per_infer": breakdown_nvtx.get("total_gpu_ms_per_infer"),
-            "method": breakdown_nvtx.get("method"),
-        }
-    elif breakdown_nvtx is not None:
-        res["breakdown_nvtx_error"] = breakdown_nvtx.get("error")
+    _attach(res, "breakdown_nvtx", breakdown_nvtx, lambda s: {
+        "phases_ms_per_infer": s["phases_ms_per_infer"],
+        "phases_pct": _pct_split(s["phases_ms_per_infer"]),
+        "attributed_frac": s.get("attributed_frac"),
+        "residual_ms_per_infer": s.get("residual_ms_per_infer"),
+        "total_gpu_ms_per_infer": s.get("total_gpu_ms_per_infer"),
+        "method": s.get("method"),
+    })
 
-    if kernel_buckets is not None and kernel_buckets.get("ok"):
-        b = kernel_buckets["buckets_ms_per_infer"]
-        res["kernel_buckets"] = {
-            "buckets_ms_per_infer": b,
-            "buckets_pct": _pct_split(b),
-            "total_gpu_ms_per_infer": kernel_buckets.get("total_gpu_ms_per_infer"),
-            "top_kernels": kernel_buckets.get("top_kernels", []),
-            "method": kernel_buckets.get("method"),
-        }
-    elif kernel_buckets is not None:
-        res["kernel_buckets_error"] = kernel_buckets.get("error")
+    _attach(res, "kernel_buckets", kernel_buckets, lambda s: {
+        "buckets_ms_per_infer": s["buckets_ms_per_infer"],
+        "buckets_pct": _pct_split(s["buckets_ms_per_infer"]),
+        "total_gpu_ms_per_infer": s.get("total_gpu_ms_per_infer"),
+        "top_kernels": s.get("top_kernels", []),
+        "method": s.get("method"),
+    })
 
-    if components_standalone is not None and components_standalone.get("ok"):
-        p = components_standalone["phases_ms_per_infer"]
-        res["components_standalone"] = {
-            "phases_ms_per_infer": p,
-            "phases_pct": _pct_split(p),
-            "method": components_standalone.get("method"),
-        }
-    elif components_standalone is not None:
-        res["components_standalone_error"] = components_standalone.get("error")
+    _attach(res, "components_standalone", components_standalone, lambda s: {
+        "phases_ms_per_infer": s["phases_ms_per_infer"],
+        "phases_pct": _pct_split(s["phases_ms_per_infer"]),
+        "method": s.get("method"),
+    })
 
     # Deep kernel/system analysis (per-phase x family, GEMM/GEMV split, launch/util overheads).
-    if kernel_analysis is not None and kernel_analysis.get("ok"):
-        res["kernel_analysis"] = {
-            k: kernel_analysis[k] for k in
-            ("per_phase_family_ms", "family_order", "gemm_split_ms", "system", "method")
-            if k in kernel_analysis
-        }
-    elif kernel_analysis is not None:
-        res["kernel_analysis_error"] = kernel_analysis.get("error")
+    _attach(res, "kernel_analysis", kernel_analysis, lambda s: {
+        k: s[k] for k in
+        ("per_phase_family_ms", "family_order", "gemm_split_ms", "system", "method")
+        if k in s
+    })
 
-    # Analytic roofline lower bound + measured efficiency (MFU/MBU, ideal-vs-achieved).
-    if roofline is not None:
-        res["roofline"] = roofline
-
-    # Server<->edge transfer sizing (KV cache + conditioning data per inference).
-    if bandwidth is not None:
-        res["bandwidth"] = bandwidth
+    # NOTE: server<->edge transfer sizing (res["bandwidth"]) is attached by cli._run_report AFTER this
+    # assembler, because it needs the headline freq this function computes (freq_hz).
 
     return res

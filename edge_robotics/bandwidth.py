@@ -12,12 +12,84 @@ This answers "how much network bandwidth is needed to run the VLM on server and 
 - `required_bandwidth_*` (if a freq is given) = that size × the inference rate.
 
 Pure arithmetic from model dims + a QuantScheme — NO torch/openpi import, so it runs in the
-import-light `report` stage (mirrors roofline.py). All dims are reused from roofline.py.
+import-light `report` stage.
 """
 
 from __future__ import annotations
 
-from .roofline import GEMMA_VARIANTS, SIGLIP, ModelShape, QuantScheme, _bytes_of
+from dataclasses import dataclass
+
+# --- model dims (mirror openpi/src/openpi/models/gemma.py get_config + the SigLIP So400m the HF
+#     PaliGemma config builds). Hardcoded (not imported) to keep this module torch/openpi-free. ---
+GEMMA_VARIANTS: dict[str, dict] = {
+    # width, depth, num_kv_heads, head_dim (the dims the KV-cache transfer sizing reads)
+    "gemma_2b": dict(width=2048, depth=18, kv_heads=1, head_dim=256),
+    "gemma_300m": dict(width=1024, depth=18, kv_heads=1, head_dim=256),
+    "dummy": dict(width=64, depth=4, kv_heads=1, head_dim=16),
+}
+# SigLIP So400m vision tower (PaliGemma default): 256 patch tokens per image.
+SIGLIP = dict(tokens=256)
+
+_DTYPE_BYTES: dict[str, float] = {
+    "fp32": 4, "float32": 4, "tf32": 4,
+    "bf16": 2, "bfloat16": 2, "fp16": 2, "float16": 2, "half": 2,
+    "fp8": 1, "float8": 1, "e4m3": 1, "e5m2": 1, "int8": 1, "i8": 1,
+    "int4": 0.5, "i4": 0.5, "nf4": 0.5,
+}
+
+
+def _bytes_of(dtype: str) -> float:
+    """Bytes per element for a dtype name (defaults to bf16=2 for anything unrecognized)."""
+    return _DTYPE_BYTES.get(str(dtype).lower(), 2.0)
+
+
+@dataclass(frozen=True)
+class QuantScheme:
+    """Precision of the data crossing the wire. Defaults = all bf16 (today's model, byte-identical).
+
+    `kv` sets the prefix KV-cache bytes (the dominant term); `activations` sets the image-embedding
+    bytes of the alternative vision-on-server split."""
+    activations: str = "bf16"
+    kv: str = "bf16"
+
+    @classmethod
+    def from_meta(cls, meta: dict) -> "QuantScheme":
+        # A run may carry a full {"weights","activations","kv","compute"} dict under meta["quant"];
+        # otherwise fall back to the single compute_dtype (bf16 today) for every field.
+        q = meta.get("quant") or {}
+        cd = meta.get("compute_dtype") or (meta.get("model") or {}).get("compute_dtype") or "bf16"
+        return cls(activations=q.get("activations", cd), kv=q.get("kv", cd))
+
+
+@dataclass
+class ModelShape:
+    """The model dims the transfer sizing needs, read from a run's meta."""
+    paligemma_variant: str
+    n_images: int
+    prefix_len: int          # image tokens + padded language tokens (the gemma_2b prefill length)
+    pi05: bool = True         # pi0 ships a continuous state token; pi05 folds state into the prompt
+    action_dim: int = 32      # state/action width; pi0 projects state into a suffix token
+    batch: int = 1
+
+    @classmethod
+    def from_meta(cls, meta: dict) -> "ModelShape":
+        # `.get(...) or default` (not `.get(k, default)`): meta may store an explicit null for a key.
+        m = meta.get("model") or {}
+        n_images = int(m.get("n_images") or 3)
+        prefix = m.get("prefix_len_nominal")
+        if prefix is None:
+            prefix = n_images * SIGLIP["tokens"] + int(meta.get("prompt_len") or 200)
+        pi05 = m.get("pi05")
+        if pi05 is None:  # fall back to the config-name convention (pi05_*, debug_pi05)
+            pi05 = str(meta.get("config_name", "")).startswith(("pi05", "debug_pi05"))
+        return cls(
+            paligemma_variant=m.get("paligemma_variant") or "gemma_2b",
+            n_images=n_images,
+            prefix_len=int(prefix),
+            pi05=bool(pi05),
+            action_dim=int(m.get("action_dim") or 32),
+            batch=int(meta.get("batch_size") or 1),
+        )
 
 
 def conditioning_transfer(shape: ModelShape, scheme: QuantScheme | None = None, *,
@@ -31,7 +103,7 @@ def conditioning_transfer(shape: ModelShape, scheme: QuantScheme | None = None, 
     VLM+action on edge => ship SigLIP image embeddings instead) for comparison.
     """
     scheme = scheme or QuantScheme()
-    pg = GEMMA_VARIANTS[shape.paligemma_variant]
+    pg = GEMMA_VARIANTS.get(shape.paligemma_variant, GEMMA_VARIANTS["gemma_2b"])
     depth, kvh, hd, width = pg["depth"], pg["kv_heads"], pg["head_dim"], pg["width"]
     kv_b = _bytes_of(scheme.kv)
 

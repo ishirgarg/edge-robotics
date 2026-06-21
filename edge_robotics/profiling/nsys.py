@@ -44,9 +44,11 @@ _KERNEL_FAMILIES: list[tuple[str, tuple[str, ...]]] = [
     ("quantize", ("quant", "dequant", "to_fp8", "to_int8", "fp8_cast", "rescale", "dynamic_scale")),
     # 'attn' + realtime-vla's QK^T kernel (matmul_abT_scale) before 'gemm' so attention isn't called gemm.
     ("attention", ("flash", "fmha", "sdpa", "attention", "attn", "softmax", "scaled_dot", "abt_scale")),
-    ("gemm", ("gemm", "cutlass", "cublas", "addmm", "bmm", "_mm", "matmul", "wgrad", "dgrad", "sgemm",
-              "hgemm", "igemm", "imma", "dp4a", "i8i8", "s8s8", "marlin", "awq", "machete")),
+    # conv BEFORE gemm: cuDNN/cutlass convolutions run as implicit-GEMM (names carry 'implicit_gemm'/
+    # 'winograd'), so they'd be swallowed by the generic 'gemm' match and leave the conv bucket empty.
     ("conv", ("conv", "cudnn", "nchw", "nhwc", "implicit_gemm", "winograd")),
+    ("gemm", ("gemm", "gemv", "cutlass", "cublas", "addmm", "bmm", "_mm", "matmul", "wgrad", "dgrad",
+              "sgemm", "hgemm", "igemm", "imma", "dp4a", "i8i8", "s8s8", "marlin", "awq", "machete")),
     # NOTE: no bare 'triton' here — it forced every Triton kernel into elementwise; inductor's fused
     # elementwise kernels still match via 'fused'/'add'/'mul', while Triton matmul/attn route correctly.
     ("elementwise", ("elementwise", "vectorized", "silu", "gelu", "rms", "norm", "layer_norm",
@@ -127,6 +129,10 @@ def _f(row: dict, *keys: str) -> float:
     return 0.0
 
 
+def _sum_total_ms(rep_path: str, report: str, n: int) -> float:
+    return sum(_f(r, "Total Time (ns)") for r in _run_stats_csv(rep_path, report)) / 1e6 / n
+
+
 def parse_nvtx_gpu_proj(rep_path: str, *, iters: int, phases: tuple[str, ...]) -> dict:
     """Per-phase GPU device time (ms/infer) from the NVTX GPU Projection Summary.
 
@@ -151,11 +157,9 @@ def parse_nvtx_gpu_proj(rep_path: str, *, iters: int, phases: tuple[str, ...]) -
         # attributed_frac can exceed 1.0 (the memops show up in the numerator but not the denominator).
         total_gpu_ms = 0.0
         try:
-            for r in _run_stats_csv(rep_path, "cuda_gpu_kern_sum"):
-                total_gpu_ms += _f(r, "Total Time (ns)") / 1e6 / n
+            total_gpu_ms += _sum_total_ms(rep_path, "cuda_gpu_kern_sum", n)
             try:
-                for r in _run_stats_csv(rep_path, "cuda_gpu_mem_time_sum"):
-                    total_gpu_ms += _f(r, "Total Time (ns)") / 1e6 / n
+                total_gpu_ms += _sum_total_ms(rep_path, "cuda_gpu_mem_time_sum", n)
             except Exception:  # noqa: BLE001  — memops report optional; kernels dominate the basis
                 pass
         except Exception:  # noqa: BLE001
@@ -197,7 +201,8 @@ def parse_kernel_buckets(rep_path: str, *, iters: int, top: int = 25) -> dict:
         for r in rows:
             name = str(r.get("Name", ""))
             ms = _f(r, "Total Time (ns)") / 1e6 / n
-            buckets[_family_of(name)] = buckets.get(_family_of(name), 0.0) + ms
+            fam = _family_of(name)
+            buckets[fam] = buckets.get(fam, 0.0) + ms
             named.append((name, ms))
         named.sort(key=lambda kv: -kv[1])
         total = sum(buckets.values())

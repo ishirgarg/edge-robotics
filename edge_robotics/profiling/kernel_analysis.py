@@ -78,6 +78,14 @@ def _gemm_is_gemv(name: str) -> bool:
     return "gemv" in _identifier(name).lower()
 
 
+def _fetchall_optional(cur: "sqlite3.Cursor", sql: str) -> list:
+    """fetchall, or [] if the table doesn't exist (CUPTI may omit memcpy/memset on a run)."""
+    try:
+        return cur.execute(sql).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
 def _merge_busy(intervals: list[tuple[int, int]]) -> tuple[int, int, int]:
     """Union coverage, min-start and max-end (ns) of a set of [start,end] intervals (handles overlap)."""
     if not intervals:
@@ -101,6 +109,7 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
     try:
         sqlite_path = rep_or_sqlite if rep_or_sqlite.endswith(".sqlite") else _ensure_sqlite(rep_or_sqlite)
         n = max(int(iters), 1)
+        sm_count = max(int(sm_count), 1)
         with contextlib.closing(sqlite3.connect(sqlite_path)) as con:
             cur = con.cursor()
 
@@ -163,35 +172,40 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
             memcpy_bytes = {"h2d": 0, "d2h": 0, "d2d": 0, "other": 0}
             memset_bytes = 0
             _COPYKIND = {1: "h2d", 2: "d2h", 8: "d2d"}  # CUpti_ActivityMemcpyKind: 1=HtoD 2=DtoH 8=DtoD
-            try:
-                mc_rows = cur.execute(
-                    "SELECT correlationId, start, end, bytes, copyKind FROM CUPTI_ACTIVITY_KIND_MEMCPY").fetchall()
-            except sqlite3.OperationalError:
-                mc_rows = []
-            for corr, st, en, nbytes, ckind in mc_rows:
+
+            def _attribute_memop(corr, st, en):
+                # record the busy span + attribute its time to the op's phase (family "memory_ops").
                 busy_intervals.append((st, en))
-                memcpy_bytes[_COPYKIND.get(ckind, "other")] += int(nbytes or 0)
-                p = phase_of(corr)
-                if p is not None:
-                    per_phase_family[p]["memory_ops"] = per_phase_family[p].get("memory_ops", 0.0) + (en - st)
-            try:
-                ms_rows = cur.execute(
-                    "SELECT correlationId, start, end, bytes FROM CUPTI_ACTIVITY_KIND_MEMSET").fetchall()
-            except sqlite3.OperationalError:
-                ms_rows = []
-            for corr, st, en, nbytes in ms_rows:
-                busy_intervals.append((st, en))
-                memset_bytes += int(nbytes or 0)
                 p = phase_of(corr)
                 if p is not None:
                     per_phase_family[p]["memory_ops"] = per_phase_family[p].get("memory_ops", 0.0) + (en - st)
 
+            mc_rows = _fetchall_optional(
+                cur, "SELECT correlationId, start, end, bytes, copyKind FROM CUPTI_ACTIVITY_KIND_MEMCPY")
+            for corr, st, en, nbytes, ckind in mc_rows:
+                _attribute_memop(corr, st, en)
+                memcpy_bytes[_COPYKIND.get(ckind, "other")] += int(nbytes or 0)
+            ms_rows = _fetchall_optional(
+                cur, "SELECT correlationId, start, end, bytes FROM CUPTI_ACTIVITY_KIND_MEMSET")
+            for corr, st, en, nbytes in ms_rows:
+                _attribute_memop(corr, st, en)
+                memset_bytes += int(nbytes or 0)
+
             # --- Launch / API counts + CPU time (async-overlapped; see note in `system` below). ---
-            api = {strings.get(nid, str(nid)).split("_v")[0]: (cnt, dur) for nid, cnt, dur in cur.execute(
-                "SELECT nameId, COUNT(*), SUM(end - start) FROM CUPTI_ACTIVITY_KIND_RUNTIME GROUP BY nameId")}
-            graph_launches = api.get("cudaGraphLaunch", (0, 0))[0]
-            eager_launches = api.get("cudaLaunchKernel", (0, 0))[0]
-            launch_api_ns = (api.get("cudaGraphLaunch", (0, 0))[1] or 0) + (api.get("cudaLaunchKernel", (0, 0))[1] or 0)
+            # nsys emits per-variant nameIds (cudaLaunchKernel_v7000, cudaLaunchKernel_ptsz, ...); strip
+            # BOTH the _v<ver> and _ptsz/_ptds suffixes and SUM across variants, else colliding keys would
+            # drop all but one variant's count/duration.
+            api: dict[str, list[int]] = {}
+            for nid, cnt, dur in cur.execute(
+                    "SELECT nameId, COUNT(*), SUM(end - start) FROM CUPTI_ACTIVITY_KIND_RUNTIME GROUP BY nameId"):
+                base = strings.get(nid, str(nid)).replace("_ptsz", "").replace("_ptds", "").split("_v")[0]
+                agg = api.setdefault(base, [0, 0])
+                agg[0] += cnt
+                agg[1] += dur or 0
+            graph = api.get("cudaGraphLaunch", [0, 0])
+            eager = api.get("cudaLaunchKernel", [0, 0])
+            graph_launches, eager_launches = graph[0], eager[0]
+            launch_api_ns = graph[1] + eager[1]
 
             # Wall = span of ALL GPU activity (kernels + memops), so busy <= wall by construction.
             gpu_busy_ns, span_lo, span_hi = _merge_busy(busy_intervals)
@@ -205,12 +219,18 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
             # Kernel-granularity distribution — many tiny kernels = launch-bound (the decode regime).
             _TINY_NS = 5000  # < 5 us
             _durs = sorted(durations_ns)
-            p90_kernel_ns = _durs[min(len(_durs) - 1, int(0.9 * len(_durs)))] if _durs else 0
+            # nearest-rank p90: index ceil(0.9*N)-1 (integer math to avoid float-rounding past the rank,
+            # e.g. int(0.9*10)==9 would alias to the max instead of the 9th-of-10 value).
+            _p90_idx = max(0, (9 * len(_durs) + 9) // 10 - 1)
+            p90_kernel_ns = _durs[_p90_idx] if _durs else 0
             tiny_count = sum(1 for d in durations_ns if d < _TINY_NS)
             tiny_time_ns = sum(d for d in durations_ns if d < _TINY_NS)
 
         def msinf(ns: float) -> float:
             return ns / 1e6 / n
+
+        def mibinf(nbytes: float) -> float:
+            return nbytes / 2**20 / n
 
         per_phase_family = {p: {f: msinf(v) for f, v in fams.items()} for p, fams in per_phase_family.items()}
         gemm_split_ms = {p: {k: msinf(v) for k, v in d.items()} for p, d in gemm_split.items()}
@@ -244,20 +264,21 @@ def analyze_sqlite(rep_or_sqlite: str, *, iters: int, phases: tuple[str, ...], s
             "tiny_kernel_frac": round(tiny_count / n_kernels, 3) if n_kernels else None,
             "tiny_kernel_time_pct": round(100.0 * tiny_time_ns / total_kernel_ns, 1) if total_kernel_ns else None,
             # Data movement per inference: host<->device PCIe (H2D/D2H) + on-device copies (D2D).
-            "memcpy_mib_per_infer": sum(memcpy_bytes.values()) / 2**20 / n,
-            "memcpy_h2d_mib_per_infer": memcpy_bytes["h2d"] / 2**20 / n,
-            "memcpy_d2h_mib_per_infer": memcpy_bytes["d2h"] / 2**20 / n,
-            "memcpy_d2d_mib_per_infer": memcpy_bytes["d2d"] / 2**20 / n,
-            "memset_mib_per_infer": memset_bytes / 2**20 / n,
+            "memcpy_mib_per_infer": mibinf(sum(memcpy_bytes.values())),
+            "memcpy_h2d_mib_per_infer": mibinf(memcpy_bytes["h2d"]),
+            "memcpy_d2h_mib_per_infer": mibinf(memcpy_bytes["d2h"]),
+            "memcpy_d2d_mib_per_infer": mibinf(memcpy_bytes["d2d"]),
+            "memset_mib_per_infer": mibinf(memset_bytes),
         }
         # Real wall-clock overhead: PRISTINE (non-nsys) wall minus GPU-busy. A small NEGATIVE value
         # is possible (CUPTI slightly inflates GPU-busy vs the un-profiled run) — reported signed, not
         # clamped, so it stays honest; `non_gpu_valid` flags when the comparison is trustworthy.
-        if pristine_wall_ms:
+        if pristine_wall_ms is not None and pristine_wall_ms > 0:
             busy_ms = msinf(gpu_busy_ns)
+            non_gpu_ms = pristine_wall_ms - busy_ms
             system["pristine_wall_ms_per_infer"] = pristine_wall_ms
-            system["non_gpu_ms_per_infer"] = pristine_wall_ms - busy_ms
-            system["non_gpu_pct"] = 100.0 * (pristine_wall_ms - busy_ms) / pristine_wall_ms
+            system["non_gpu_ms_per_infer"] = non_gpu_ms
+            system["non_gpu_pct"] = 100.0 * non_gpu_ms / pristine_wall_ms
             system["non_gpu_valid"] = busy_ms <= pristine_wall_ms
 
         return {

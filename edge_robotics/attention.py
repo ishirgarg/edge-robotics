@@ -31,7 +31,6 @@ import numpy as np
 def load_real_model(checkpoint: str, config_name: str, *, prompt_len: int, device):
     """Build PI0Pytorch EAGER (no compile) and load the real converted weights."""
     import safetensors.torch as st
-    import torch  # noqa: F401
 
     from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 
@@ -44,7 +43,7 @@ def load_real_model(checkpoint: str, config_name: str, *, prompt_len: int, devic
 
     path = checkpoint if checkpoint.endswith(".safetensors") else os.path.join(checkpoint, "model.safetensors")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"real checkpoint not found: {path} (run scripts/get_pi05_libero_torch.py)")
+        raise FileNotFoundError(f"real checkpoint not found: {path} (run scripts/get_pi0_torch.py --config-name <cfg>)")
     missing, _ = st.load_model(model, path, strict=False)
     real_missing = [k for k in missing if "embed_tokens" not in k and "rotary" not in k]
     if real_missing:
@@ -159,7 +158,7 @@ def bucket_attention(attn: np.ndarray, layout: dict, *, action_horizon: int, suf
         "per_layer_fraction": per_layer,
         "per_step_fraction": per_step,
         "shape": {"n_steps": n_steps, "n_layers": n_layers, "heads": heads,
-                  "action_horizon": q, "kv_len": kv},
+                  "action_horizon": action_horizon, "suffix_len": q, "kv_len": kv},
         "checksum_sum_over_modalities": float(sum(overall.values())),  # ~1.0 expected
     }
 
@@ -181,6 +180,10 @@ def make_plots(attn: np.ndarray, buckets: dict, layout: dict, frame: dict, outdi
     paths = []
     prompt = layout.get("prompt", "")
 
+    def save(fig, name):
+        p = os.path.join(outdir, name)
+        fig.savefig(p, dpi=130); plt.close(fig); paths.append(p)
+
     # 1. Overall attention mass per modality (bar).
     ov = buckets["overall_fraction"]
     fig, ax = plt.subplots(figsize=(9, 4))
@@ -188,7 +191,7 @@ def make_plots(attn: np.ndarray, buckets: dict, layout: dict, frame: dict, outdi
     ax.bar(range(len(names)), [ov[k] for k in names], color="#4C72B0")
     ax.set_ylabel("attention fraction"); ax.set_title(f"Action→prefix attention by modality\n{prompt[:70]}")
     ax.set_xticks(range(len(names))); ax.set_xticklabels(names, rotation=30, ha="right", fontsize=8)
-    fig.tight_layout(); p = os.path.join(outdir, "attn_by_modality.png"); fig.savefig(p, dpi=130); plt.close(fig); paths.append(p)
+    fig.tight_layout(); save(fig, "attn_by_modality.png")
 
     # 2. Layer x modality heatmap.
     pl = buckets["per_layer_fraction"]
@@ -199,7 +202,7 @@ def make_plots(attn: np.ndarray, buckets: dict, layout: dict, frame: dict, outdi
     ax.set_yticks(range(len(mods))); ax.set_yticklabels(mods, fontsize=8)
     ax.set_xlabel("action-expert layer"); ax.set_title("Attention fraction by layer x modality")
     fig.colorbar(im, ax=ax, fraction=0.025); fig.tight_layout()
-    p = os.path.join(outdir, "attn_layer_x_modality.png"); fig.savefig(p, dpi=130); plt.close(fig); paths.append(p)
+    save(fig, "attn_layer_x_modality.png")
 
     # 3. Per-denoise-step trend: vision vs language vs self.
     ps = buckets["per_step_fraction"]
@@ -213,7 +216,7 @@ def make_plots(attn: np.ndarray, buckets: dict, layout: dict, frame: dict, outdi
         ax.plot(steps, ps["proprioception"], "-o", label="proprioception")
     ax.set_xlabel("denoise step"); ax.set_ylabel("attention fraction"); ax.legend()
     ax.set_title("Attention vs denoise step"); fig.tight_layout()
-    p = os.path.join(outdir, "attn_vs_denoise_step.png"); fig.savefig(p, dpi=130); plt.close(fig); paths.append(p)
+    save(fig, "attn_vs_denoise_step.png")
 
     # 4. Spatial: where on the base camera do the actions look? (16x16 patch attention over the image)
     grid = _spatial_base_attention(attn, layout)
@@ -223,7 +226,7 @@ def make_plots(attn: np.ndarray, buckets: dict, layout: dict, frame: dict, outdi
     axes[1].imshow(grid, cmap="hot", alpha=0.55, extent=(0, grid.shape[1], grid.shape[0], 0))
     axes[1].set_title("action→base-camera attention (16x16 patches)"); axes[1].axis("off")
     fig.suptitle(prompt[:80]); fig.tight_layout()
-    p = os.path.join(outdir, "attn_spatial_base.png"); fig.savefig(p, dpi=130); plt.close(fig); paths.append(p)
+    save(fig, "attn_spatial_base.png")
     return paths
 
 
@@ -242,7 +245,7 @@ def analyze(*, checkpoint: str, config_name: str, gpu: int, num_steps: int, epis
     device = torch.device("cuda")
     model, cfg = load_real_model(checkpoint, config_name, prompt_len=prompt_len, device=device)
     eff_prompt_len = int(cfg.max_token_len)  # the effective length (native unless prompt_len overrode it)
-    frame = libero_obs.load_frame(config_name, episode, frame_idx)
+    frame = libero_obs.load_frame(config_name, episode, frame_idx, checkpoint=checkpoint)
     obs, layout = libero_obs.build_observation(
         frame, prompt_len=eff_prompt_len, action_dim=int(cfg.action_dim), device=device,
         discrete_state=bool(cfg.discrete_state_input))
