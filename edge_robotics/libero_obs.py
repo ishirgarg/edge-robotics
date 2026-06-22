@@ -235,6 +235,24 @@ def load_frame(config_name: str, episode: int = 0, frame: int = 0, *, checkpoint
     return _frame_dict(images, state, spec["prompt"], dataset, "synthetic-random", episode, frame)
 
 
+def resize_with_pad_uint8(img: np.ndarray, px: int = _IMG_PX) -> np.ndarray:
+    """Resize-with-pad an HxWx3 uint8 image to px x px exactly as the model's input pipeline does.
+
+    Scale preserving aspect ratio to fit within px x px, then center-pad with black. This is the
+    image the SigLIP encoder actually sees (and thus what the 16x16 patch attention grid aligns to),
+    so the attention heatmap overlays it rather than the raw (possibly non-square) frame."""
+    from PIL import Image
+
+    h, w = img.shape[:2]
+    ratio = max(w / px, h / px)
+    rw, rh = int(w / ratio), int(h / ratio)
+    im = Image.fromarray(img).resize((rw, rh), Image.BILINEAR)
+    canvas = np.zeros((px, px, img.shape[2]), dtype=np.uint8)
+    ph, pw = (px - rh) // 2, (px - rw) // 2
+    canvas[ph:ph + rh, pw:pw + rw] = np.asarray(im, dtype=np.uint8)
+    return canvas
+
+
 def build_observation(frame: dict, *, prompt_len: int, action_dim: int, device, discrete_state: bool):
     """Assemble the model `Observation` + the prefix token layout the attention study buckets over.
 
@@ -242,23 +260,14 @@ def build_observation(frame: dict, *, prompt_len: int, action_dim: int, device, 
     tokens (pi05 with discrete_state=True folds a discretized state span into the prompt; pi05_libero
     uses discrete_state=False, so state is absent and the prompt is just the task)."""
     import torch
-    from PIL import Image
 
     from openpi.models import model as _model
     from openpi.models.tokenizer import PaligemmaTokenizer
     from openpi.shared import array_typing as at
 
     def _to_tensor(img: np.ndarray) -> torch.Tensor:
-        # Resize-with-pad to 224 in [-1,1] NCHW, matching openpi's resize_with_pad: scale preserving
-        # aspect ratio to fit within 224x224, then center-pad with black. For square LIBERO frames this
-        # is a plain resize (no padding); for non-square DROID/ALOHA frames it avoids distortion.
-        h, w = img.shape[:2]
-        ratio = max(w / _IMG_PX, h / _IMG_PX)
-        rw, rh = int(w / ratio), int(h / ratio)
-        im = Image.fromarray(img).resize((rw, rh), Image.BILINEAR)
-        canvas = np.zeros((_IMG_PX, _IMG_PX, img.shape[2]), dtype=np.uint8)
-        ph, pw = (_IMG_PX - rh) // 2, (_IMG_PX - rw) // 2
-        canvas[ph:ph + rh, pw:pw + rw] = np.asarray(im, dtype=np.uint8)
+        # Resize-with-pad to 224 (matching openpi), then -> [-1,1] NCHW (the model's expected range).
+        canvas = resize_with_pad_uint8(img, _IMG_PX)
         arr = canvas.astype(np.float32) / 255.0 * 2.0 - 1.0   # -> [-1, 1], black pad -> -1
         return torch.from_numpy(arr).permute(2, 0, 1)[None].to(device)  # [1,3,H,W]
 

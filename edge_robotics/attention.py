@@ -164,11 +164,22 @@ def bucket_attention(attn: np.ndarray, layout: dict, *, action_horizon: int, suf
 
 
 def _spatial_base_attention(attn: np.ndarray, layout: dict) -> np.ndarray:
-    """Per-patch base-camera attention as a 16x16 grid (avg over steps,layers,heads,queries)."""
+    """Per-patch base-camera attention as a 16x16 grid (avg over steps,layers,heads,queries).
+
+    SigLIP patch tokens are row-major, so index = row*side + col; reshape(side, side) yields a
+    [row(y), col(x)] grid that lines up with the (top-down) image once upsampled."""
     lo, hi = layout["cameras"]["base"]
     side = int(round((hi - lo) ** 0.5))  # 256 -> 16
     grid = attn[..., lo:hi].mean(axis=(0, 1, 2, 3))  # [256]
     return grid.reshape(side, side)
+
+
+def _upsample_to_pixels(grid: np.ndarray, px: int) -> np.ndarray:
+    """Upsample the 16x16 patch-attention grid to a px x px per-pixel map (bilinear), so every pixel
+    is colored by its (interpolated) attention rather than rendering blocky patches."""
+    from PIL import Image
+    im = Image.fromarray(grid.astype(np.float32), mode="F").resize((px, px), Image.BILINEAR)
+    return np.asarray(im, dtype=np.float32)
 
 
 def make_plots(attn: np.ndarray, buckets: dict, layout: dict, frame: dict, outdir: str) -> list[str]:
@@ -218,13 +229,21 @@ def make_plots(attn: np.ndarray, buckets: dict, layout: dict, frame: dict, outdi
     ax.set_title("Attention vs denoise step"); fig.tight_layout()
     save(fig, "attn_vs_denoise_step.png")
 
-    # 4. Spatial: where on the base camera do the actions look? (16x16 patch attention over the image)
+    # 4. Spatial: where on the base camera do the actions look? Upsample the 16x16 patch attention to
+    #    a per-pixel map over the MODEL-PROCESSED 224x224 base image (resize-with-pad — what the SigLIP
+    #    encoder actually saw), so every pixel is colored and the overlay aligns even for non-square
+    #    (DROID/ALOHA) frames, where the raw image would mismatch the padded patch grid.
+    from . import libero_obs
     grid = _spatial_base_attention(attn, layout)
+    base_img = libero_obs.resize_with_pad_uint8(np.asarray(frame["base_image"]))
+    px = base_img.shape[0]
+    heat = _upsample_to_pixels(grid, px)
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    axes[0].imshow(frame["base_image"]); axes[0].set_title("base camera"); axes[0].axis("off")
-    axes[1].imshow(frame["base_image"], extent=(0, grid.shape[1], grid.shape[0], 0))
-    axes[1].imshow(grid, cmap="hot", alpha=0.55, extent=(0, grid.shape[1], grid.shape[0], 0))
-    axes[1].set_title("action→base-camera attention (16x16 patches)"); axes[1].axis("off")
+    axes[0].imshow(base_img); axes[0].set_title("base camera (model input)"); axes[0].axis("off")
+    axes[1].imshow(base_img)
+    hm = axes[1].imshow(heat, cmap="jet", alpha=0.5)
+    axes[1].set_title("action→base-camera attention (per-pixel)"); axes[1].axis("off")
+    fig.colorbar(hm, ax=axes[1], fraction=0.046)
     fig.suptitle(prompt[:80]); fig.tight_layout()
     save(fig, "attn_spatial_base.png")
     return paths
